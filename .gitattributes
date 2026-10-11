@@ -1,0 +1,3 @@
+# Byte-exact checkout on every platform: tests bind source files to recorded sha256 hashes,
+# and the release builder rejects shell scripts with CRLF line endings.
+* -text

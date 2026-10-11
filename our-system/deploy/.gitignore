@@ -1,0 +1,6 @@
+.env
+*.sqlite*
+*-manifest.json
+pytest-tmp*/
+runtime-venv/
+__pycache__/

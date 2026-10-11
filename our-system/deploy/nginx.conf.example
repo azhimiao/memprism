@@ -1,0 +1,23 @@
+# Host nginx template; replace domain and certificate paths before nginx -t.
+# The app port is bound to loopback. Only health/Add/Search are exposed.
+server {
+    listen 443 ssl;
+    server_name REPLACE_DOMAIN;
+    ssl_certificate /etc/ssl/aml/fullchain.pem;
+    ssl_certificate_key /etc/ssl/aml/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    client_max_body_size 10m;
+    access_log off;
+    error_log /var/log/nginx/aml-error.log warn;
+    location ~ ^/(health|add|search)$ {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header Authorization $http_authorization;
+        proxy_set_header X-API-Key $http_x_api_key;
+        proxy_connect_timeout 5s;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+        proxy_buffering off;
+    }
+    location / { return 404; }
+}

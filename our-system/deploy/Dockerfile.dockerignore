@@ -1,0 +1,8 @@
+# Dockerfile-specific context allowlist; excludes DBs, credentials, caches and venvs.
+**
+!app/
+!app/*.py
+!deploy/
+!deploy/*.py
+!deploy/Dockerfile
+!requirements-cycle2.txt

@@ -1,0 +1,17 @@
+# Server overlay: host loopback 28717 -> container 8787, host env and data paths. Use with deploy/compose.yaml.
+# The host port avoids 8787, which another service already uses on the target host.
+services:
+  aml:
+    image: aml-cycle2-v4:server
+    env_file: ${AML_ENV_FILE:-/etc/aml/aml.env}
+    environment:
+      AML_PORT: "8787"
+      AML_HOST: "0.0.0.0"
+      AML_DB_PATH: /var/lib/aml/aml-hybrid.sqlite
+    # Compose concatenates port lists across files; !override drops the base 127.0.0.1:8000 mapping.
+    ports: !override
+      - "127.0.0.1:28717:8787"
+    volumes:
+      - /var/lib/aml:/var/lib/aml
+    cpus: 2
+    mem_limit: 4g

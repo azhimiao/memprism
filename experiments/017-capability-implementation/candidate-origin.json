@@ -1,0 +1,33 @@
+{
+  "new": {
+    "api.py": "5c37212bc4b46ac822b5ed3a9f5b6bd410d175879e8b9ca1120d8a6bc73cc459",
+    "capability_views.py": "bd49214853e8b45fd28958f7baefae24e581d71fef1c80ae7d53d6b9a1772a37",
+    "claim_projection.py": "934b5c5d9f55738f873bbb69abffe32e183d191df84f269f861d29595a7161ac",
+    "config.py": "3b5446e3c8f1d526a5ca1a27df283f3aa2c62d6059607503e38c2e4cc3f2e6d4",
+    "embeddings.py": "373fd9a1582aba90fb022f14ab0cbd0b94e2b32375c3f9b42cf39ec171a22095",
+    "exact_dense.py": "e69dcedbe722218bf5da2147b61833315c43c361e1ee1612ecd2e47376259e67",
+    "governance.py": "01fc818f6ea8bb96130b203a865372b0ae9a7cd1199839acf03ade92244f5340",
+    "index.py": "7e0a1f50d636211953385d423064be6e8981f7d4962f346e4a0824505508c014",
+    "ingest.py": "51369e90d00e70cb9541790bd33039b6be8c876be1765950f64bc229e03ed8d3",
+    "jobs.py": "2a62c97ae0e92a3f8e0ab296d9d9d27e2b430a0711f7c2c146440017f31ca0fd",
+    "k0_migrate.py": "3660c41b36041e4a77db0c0b61706a546c7f064165b7daf876c6c5d754667d7e",
+    "memory_core.py": "0e93268611c90a759be0c64477e998eedffbc9f0a479421034a71bc531f465f3",
+    "models.py": "e2b6d07d09cb2d79c33e562a22119c85d7c33b7af6f3387c21aa13a63894a2a6",
+    "profiles.py": "6489e9f26e9811e1ab2942df5eb283f91e0b964a66f6f2457cacdf0499564f78",
+    "queryplan.py": "27ab5148c294451d1714dc59815485f2585b131014898c1abae8995d68e1dd40",
+    "rendering.py": "9a4175227bfde1823610680cdc0b7e84df1de4bba5a3f100487cc60a5e2e910d",
+    "retrieval.py": "96fcb3ae864e507ba834cfaff05e70bd1b1d341df2300e266c44ebcdce8715d7",
+    "safety.py": "265efb76249990300fc18e32e1e20043b6f9918de275217d1fa8061a9a6fba4d",
+    "segments.py": "c25a4e9999f19172ac6f45b16d6611d8fab720f3d9c515a6317efdad4b603180",
+    "set_selection.py": "30f68a54b998f474948b72d663d6f809970c06aafc14df25fc54d51a0afc6a76",
+    "store.py": "93ea9b4e46f3469d1fbd498bf05a5b949c841fe1f945cab96b58d32cc9ece505",
+    "support_groups.py": "1725b6ce9a6d17724c47ece06c6cb00fd853fbe0766197253ae3616075815da2",
+    "transport.py": "76c86b65fee629b3d762101d8ffd6b845ee694bc0e4a0f06fe35944a5940902e",
+    "vector_checks.py": "392f51266ee2b39a90afd7a7c8b87b057c4459a12d62f5a41796efe072fd3eb1",
+    "__init__.py": "b0a01bcbd6a0540eddc0aea9682dbe63363997a72b0b2a58865005edf256760a"
+  },
+  "baseline_origin_sha256": "59828cc487806243c40a6b0446236054a4ceb8f1fec79b4a68c4795a03f5ad45",
+  "effects_default": false,
+  "engineering_only": true,
+  "revision": "v5 runtime investigation, source normalizer restored"
+}

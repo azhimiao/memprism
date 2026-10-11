@@ -1,0 +1,32 @@
+services:
+  aml:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: aml-cycle2-v4:local
+    env_file: ${AML_ENV_FILE:-.env}
+    environment:
+      AML_DB_PATH: /var/lib/aml/cycle2-v4.sqlite
+      AML_PORT: "8000"
+      AML_HOST: "0.0.0.0"
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - v4-data:/var/lib/aml
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    cpus: 2
+    mem_limit: 2g
+    pids_limit: 128
+    stop_grace_period: 60s
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+volumes:
+  v4-data:

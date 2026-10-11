@@ -1,0 +1,41 @@
+{
+  "revision": "cycle2-coordinator-lock-wait-v1",
+  "new": {
+    "__init__.py": "b0a01bcbd6a0540eddc0aea9682dbe63363997a72b0b2a58865005edf256760a",
+    "api.py": "a4ed6375224557216f9be37d110f29877692b9c4b3642ff1e8d5815b126d75ee",
+    "atomic_memory.py": "dc0e653e9a445c6ea3977c690741e41f7eeea9a116a48aab6e5a010452cd7cfd",
+    "capability_views.py": "bd49214853e8b45fd28958f7baefae24e581d71fef1c80ae7d53d6b9a1772a37",
+    "claim_projection.py": "934b5c5d9f55738f873bbb69abffe32e183d191df84f269f861d29595a7161ac",
+    "config.py": "4701af6da1c01328043723b1121e76c0ce2b700f569eec2378aa8dff8de4bab2",
+    "embeddings.py": "ab7d8e9c5ca7d2b449bf36207555866638354ce99b139f7f9fe5188b5a5c7fdd",
+    "evidence_navigation.py": "ff29443c8a5d359b2dc5dda6ea93f36362629b054ed070b82404a09600373518",
+    "exact_dense.py": "e69dcedbe722218bf5da2147b61833315c43c361e1ee1612ecd2e47376259e67",
+    "governance.py": "01fc818f6ea8bb96130b203a865372b0ae9a7cd1199839acf03ade92244f5340",
+    "index.py": "7e0a1f50d636211953385d423064be6e8981f7d4962f346e4a0824505508c014",
+    "ingest.py": "1953c3605251c89299512d39cdd6a5ebba8e1f630d47a6a1394a89b65ada3002",
+    "jobs.py": "5f2820da0322aee715637d3dd88a22e0c942c398326de2395692f9ab7aaaed35",
+    "k0_migrate.py": "3660c41b36041e4a77db0c0b61706a546c7f064165b7daf876c6c5d754667d7e",
+    "memory_core.py": "58ad436f807722e36e3369bc7e19987498f040c8305512e99d8b3aed6cdd5828",
+    "models.py": "e2b6d07d09cb2d79c33e562a22119c85d7c33b7af6f3387c21aa13a63894a2a6",
+    "profiles.py": "94ccbdda42813bb2184d317bf72bd1208668ac54c2ce8295525da0d176e3389c",
+    "queryplan.py": "8b205012a96700e42d8624b4ba3863a75ff798be87ecf181fc9968b52e525036",
+    "rendering.py": "ef5fd0adc73b611db73e6bbd39de1bff25849aef281c3e2c5becb95c8cdc8217",
+    "reranking.py": "93c41efdf1eea4f42a4b6a73d735f659538cbec6b3223751d965699b4b7909f3",
+    "retrieval.py": "b0dc60d3cfe0ead1c92464c0bfa2f1a4edb4da785f36043492d374efe72e3333",
+    "safety.py": "265efb76249990300fc18e32e1e20043b6f9918de275217d1fa8061a9a6fba4d",
+    "segments.py": "c25a4e9999f19172ac6f45b16d6611d8fab720f3d9c515a6317efdad4b603180",
+    "set_selection.py": "30f68a54b998f474948b72d663d6f809970c06aafc14df25fc54d51a0afc6a76",
+    "store.py": "4baf62f5d76738f069e1f1abf15e7eab5e6b9885590cd43cabd97500d8eb34a8",
+    "support_groups.py": "1725b6ce9a6d17724c47ece06c6cb00fd853fbe0766197253ae3616075815da2",
+    "transport.py": "76c86b65fee629b3d762101d8ffd6b845ee694bc0e4a0f06fe35944a5940902e",
+    "vector_checks.py": "392f51266ee2b39a90afd7a7c8b87b057c4459a12d62f5a41796efe072fd3eb1"
+  },
+  "baseline_origin_sha256": "59828cc487806243c40a6b0446236054a4ceb8f1fec79b4a68c4795a03f5ad45",
+  "parent_022_origin_sha256": "d1bedb9c149d5504811cb8e157718a04433840b416cb92acf6cce0b2556d8b33",
+  "changes": [
+    "AML_COORDINATOR_LOCK_TIMEOUT_SECONDS"
+  ],
+  "effects_default": false,
+  "engineering_only": true,
+  "note": "022 with a configurable SQLite wait for coordinator transactions and coordinator Add commits; the application default stays 0.1s and deployment examples set 30s. Retrieval config hash is unchanged."
+}
