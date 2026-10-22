@@ -52,7 +52,7 @@ python -m venv .venv && . .venv/bin/activate
 pip install --no-deps -r requirements-cycle2.txt
 set -a; . deploy/server/env.server.example; set +a
 export AML_DB_PATH="$PWD/data/aml.sqlite" AML_HOST=127.0.0.1 \
-       AML_SERVICE_API_KEY=<choose a key> DASHSCOPE_API_KEY=<your DashScope key>
+       AML_SERVICE_API_KEY='<choose-a-key>' DASHSCOPE_API_KEY='<your-DashScope-key>'
 python -m deploy.start
 ```
 
