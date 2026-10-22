@@ -1131,10 +1131,69 @@ def require_v4_candidate(tmp_path):
             assert lockwait['parent_022_origin_sha256']==hashlib.sha256(fixes_path.read_bytes()).hexdigest()
             if actual_files==set(lockwait['new']) and all(hashlib.sha256((actual/name).read_bytes()).hexdigest()==value for name,value in lockwait['new'].items()):
                 candidate_path=lockwait_path
+        streaming_path=root/'experiments/030-streaming-accounting/candidate-origin.json'
+        if streaming_path.is_file():
+            streaming=json.loads(streaming_path.read_text(encoding='utf-8'))
+            assert streaming['parent_027_origin_sha256']==hashlib.sha256(lockwait_path.read_bytes()).hexdigest()
+            if actual_files==set(streaming['new']) and all(hashlib.sha256((actual/name).read_bytes()).hexdigest()==value for name,value in streaming['new'].items()):
+                candidate_path=streaming_path
+        streaming_v2_path=root/'experiments/030-streaming-accounting/candidate-origin-v2.json'
+        if streaming_v2_path.is_file():
+            streaming_v2=json.loads(streaming_v2_path.read_text(encoding='utf-8'))
+            assert streaming_v2['parent_030_v1_sha256']==hashlib.sha256(streaming_path.read_bytes()).hexdigest()
+            if actual_files==set(streaming_v2['new']) and all(hashlib.sha256((actual/name).read_bytes()).hexdigest()==value for name,value in streaming_v2['new'].items()):
+                candidate_path=streaming_v2_path
+        streaming_v3_path=root/'experiments/030-streaming-accounting/candidate-origin-v3.json'
+        if streaming_v3_path.is_file():
+            streaming_v3=json.loads(streaming_v3_path.read_text(encoding='utf-8'))
+            assert streaming_v3['parent_030_v2_sha256']==hashlib.sha256(streaming_v2_path.read_bytes()).hexdigest()
+            if actual_files==set(streaming_v3['new']) and all(hashlib.sha256((actual/name).read_bytes()).hexdigest()==value for name,value in streaming_v3['new'].items()):
+                candidate_path=streaming_v3_path
+        streaming_v4_path=root/'experiments/030-streaming-accounting/candidate-origin-v4.json'
+        if streaming_v4_path.is_file():
+            streaming_v4=json.loads(streaming_v4_path.read_text(encoding='utf-8'))
+            assert streaming_v4['parent_030_v3_sha256']==hashlib.sha256(streaming_v3_path.read_bytes()).hexdigest()
+            if actual_files==set(streaming_v4['new']) and all(hashlib.sha256((actual/name).read_bytes()).hexdigest()==value for name,value in streaming_v4['new'].items()):
+                candidate_path=streaming_v4_path
+        atom_prompt_path=root/'experiments/031-model-comparison/candidate-atom-prompt-v1.json'
+        if atom_prompt_path.is_file():
+            atom_prompt=json.loads(atom_prompt_path.read_text(encoding='utf-8'))
+            assert atom_prompt['parent_030_v4_sha256']==hashlib.sha256(streaming_v4_path.read_bytes()).hexdigest()
+            if actual_files==set(atom_prompt['new']) and all(hashlib.sha256((actual/name).read_bytes()).hexdigest()==value for name,value in atom_prompt['new'].items()):
+                candidate_path=atom_prompt_path
+        concurrency_path=root/'experiments/036-real-dimension-concurrency/candidate-concurrency-v1.json'
+        if concurrency_path.is_file():
+            concurrency=json.loads(concurrency_path.read_text(encoding='utf-8'))
+            assert concurrency['parent_031_sha256']==hashlib.sha256(atom_prompt_path.read_bytes()).hexdigest()
+            if actual_files==set(concurrency['new']) and all(hashlib.sha256((actual/name).read_bytes()).hexdigest()==value for name,value in concurrency['new'].items()):
+                candidate_path=concurrency_path
+        concurrency_v2_path=concurrency_path.with_name('candidate-concurrency-v2.json')
+        if concurrency_v2_path.is_file():
+            concurrency_v2=json.loads(concurrency_v2_path.read_text(encoding='utf-8'))
+            assert concurrency_v2['parent_036_v1_sha256']==hashlib.sha256(concurrency_path.read_bytes()).hexdigest()
+            if actual_files==set(concurrency_v2['new']) and all(hashlib.sha256((actual/name).read_bytes()).hexdigest()==value for name,value in concurrency_v2['new'].items()):
+                candidate_path=concurrency_v2_path
+        concurrency_v3_path=concurrency_path.with_name('candidate-concurrency-v3.json')
+        if concurrency_v3_path.is_file():
+            concurrency_v3=json.loads(concurrency_v3_path.read_text(encoding='utf-8'))
+            assert concurrency_v3['parent_036_v2_sha256']==hashlib.sha256(concurrency_v2_path.read_bytes()).hexdigest()
+            if actual_files==set(concurrency_v3['new']) and all(hashlib.sha256((actual/name).read_bytes()).hexdigest()==value for name,value in concurrency_v3['new'].items()):
+                candidate_path=concurrency_v3_path
+        performance_path=root/'experiments/037-retrieval-performance/candidate-final.json'
+        if performance_path.is_file():
+            performance=json.loads(performance_path.read_text(encoding='utf-8'))
+            assert performance['parent_036_v3_sha256']==hashlib.sha256(concurrency_v3_path.read_bytes()).hexdigest()
+            if actual_files==set(performance['new']) and all(hashlib.sha256((actual/name).read_bytes()).hexdigest()==value for name,value in performance['new'].items()):
+                candidate_path=performance_path
         if actual == (root / 'our-system/app').resolve() and candidate_path.is_file():
             candidate = json.loads(candidate_path.read_text(encoding='utf-8'))
             assert candidate['baseline_origin_sha256'] == hashlib.sha256((expected.parent/'origin.json').read_bytes()).hexdigest()
-            assert candidate['effects_default'] is False and candidate['engineering_only'] is True
+            if candidate_path in {concurrency_path, concurrency_v2_path, concurrency_v3_path, performance_path}:
+                assert candidate['effects_default'] is True and candidate['default_retrieval_changed'] is False
+                assert candidate['default_lock_wait_seconds'] == Settings(db_path=tmp_path/'lock-default.sqlite').coordinator_lock_timeout_seconds == 30
+            else:
+                assert candidate['effects_default'] is False
+            assert candidate['engineering_only'] is True
             assert actual_files == set(candidate['new'])
             assert all(hashlib.sha256((actual/name).read_bytes()).hexdigest()==value for name,value in candidate['new'].items())
             base = Settings(db_path=tmp_path/'e38-default.sqlite',profile_id='span_sync')

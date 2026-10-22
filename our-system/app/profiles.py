@@ -61,6 +61,10 @@ class Profile:
             identity.update(temporal_source_dates=True, temporal_date_renderer='query_source_date_v1')
         if settings.profile_id.startswith('cycle2_'):
             identity.update(cycle2_version='dual-evidence-v1', sentence_index=settings.sentence_index,
+                add_preparation_policy='user_lease_v1', user_preparation_wait_seconds=120,
+                search_attempts=8, query_snapshot_policy='request_generation_fenced_v2',
+                embedding_ledger_policy='serialized_wal_final_authorization_v2',
+                embedding_reuse='guarded_process_scope_v1',
                 parent_evidence=settings.parent_evidence,metadata_roles=settings.metadata_roles,
                 metadata_dates=settings.metadata_dates,reranker_model=settings.reranker_model,
                 reranker_device=settings.reranker_device,reranker_max_length=settings.reranker_max_length,

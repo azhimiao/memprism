@@ -174,11 +174,24 @@ class RetrievalService:
         return response
 
     def search_with_trace(self, request: SearchRequest) -> tuple[SearchResponse, dict[str, object]]:
+        from app.embedding_accounting import embedding_scope
+        from uuid import uuid4
+        with embedding_scope(request.user_id, uuid4().hex, 'search'):
+            return self._search_scoped(request)
+
+    def _search_scoped(self, request: SearchRequest) -> tuple[SearchResponse, dict[str, object]]:
         if self.coordinator is None:
             return self._search_once(request)
         discarded = []
-        for attempt in range(3):
+        request_generation = None
+        for attempt in range(self.coordinator.profile.identity['search_attempts']):
             stamp = self.coordinator.require_ready(request.user_id)
+            if request_generation is None:
+                request_generation = stamp[0]
+            elif stamp[0] != request_generation:
+                # A retry may reuse its query vector only within the original
+                # configuration generation, including A -> B -> A changes.
+                raise NotReady('query_config_generation_changed')
             try:
                 return self._search_once(request, stamp=stamp, formal_attempt=attempt+1,
                                          prior_revocations=discarded)
@@ -240,8 +253,16 @@ class RetrievalService:
                     try:
                         if self.coordinator is not None:
                             def check_dispatch():
-                                if self.coordinator.require_ready(plan.user_id) != stamp:
-                                    raise SnapshotChanged("query_dispatch_snapshot_changed")
+                                # Only the caller's query leaves here, never a
+                                # saved memory. An intervening Add must not make
+                                # this source-independent computation stale.
+                                # Readiness/configuration checks still run before
+                                # every dispatch (including provider retries).
+                                nonlocal stamp
+                                fresh_stamp = self.coordinator.require_ready(plan.user_id)
+                                if fresh_stamp[0] != stamp[0]:
+                                    raise NotReady('query_config_generation_changed')
+                                stamp = fresh_stamp
                             check_dispatch()
                             batch = provider.embed_guarded([plan.query_text], before_dispatch=check_dispatch) if hasattr(provider, "embed_guarded") else provider.embed([plan.query_text])
                         else:
@@ -254,6 +275,14 @@ class RetrievalService:
                         reason, usage = exc.code, exc.usage or usage
         if self.coordinator is not None and reason:
             raise NotReady(reason)
+        if self.coordinator is not None:
+            # Start the evidence snapshot after the slow remote computation.
+            # Add200 before this point must be visible; changes while evidence
+            # is selected still fail the unchanged final/source checks below.
+            fresh_stamp = self.coordinator.require_ready(plan.user_id)
+            if fresh_stamp[0] != stamp[0]:
+                raise NotReady('query_config_generation_changed')
+            stamp = fresh_stamp
         snapshot = self.store.search_snapshot(
             user_id=plan.user_id, match_query=match_query, query_vector=query_vector,
             version=version, dimensions=dimensions, mode=mode,
@@ -264,6 +293,11 @@ class RetrievalService:
             **({'exact_acceleration':True} if settings.exact_dense_acceleration else {}),
         )
         if self.coordinator is not None and snapshot.degraded_reason:
+            if snapshot.degraded_reason == "query_vector_unavailable" and query_vector is None:
+                # The user was empty during coverage checking, then its first
+                # Add committed. Retry against that published route and obtain
+                # a query vector; never turn it into a fake empty/FTS success.
+                raise SnapshotChanged("first_add_during_query_preparation")
             raise NotReady(snapshot.degraded_reason)
         unknown_dropped=0
         if settings.unknown_dense_floor is not None:
@@ -497,6 +531,7 @@ class RetrievalService:
             "return_char_budget": settings.return_char_budget,
             "return_token_budget":settings.return_token_budget,"packing":packing,
             "messages_omitted": len(gated) - len(kept), "query_embedding_usage": usage,
+            "query_embedding_usage_scope": "last_snapshot_attempt; all dispatches are in the embedding ledger",
             "latency_ms": (time.perf_counter() - started) * 1000,
         }
         if prior_revocations:

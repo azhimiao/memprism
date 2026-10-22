@@ -1,6 +1,6 @@
 # MemPrism
 
-MemPrism is the memory service submitted to the Agent Memory Leaderboard (AML) Cycle 2, open-source
+MemPrism is a candidate memory service for the Agent Memory Leaderboard (AML) Cycle 2, open-source
 method category. It implements the leaderboard's HTTP contract:
 
 | Endpoint | Behaviour |
@@ -23,7 +23,7 @@ method category. It implements the leaderboard's HTTP contract:
   retries against a stable snapshot and returns 503 if the snapshot keeps changing, so a result never
   mixes two commits.
 
-The deployed configuration is `our-system/deploy/server/env.server.example`
+The existing 027 deployment template is `our-system/deploy/server/env.server.example`
 (`AML_PROFILE=cycle2_dense`, `AML_RETRIEVAL_MODE=raw_hybrid_rrf`); `/health` reports its
 `config_hash` (`08e945a951ade441…`). Experimental mechanisms in the code base (sentence index,
 neighbour/parent expansion, typed or option routing, temporal projection, reranking, atomic memories,
@@ -63,25 +63,56 @@ cd our-system
 python -m pytest -q -p no:cacheprovider
 ```
 
-The suite runs offline (embedding providers are replaced by doubles). At the first published commit it
-reports 892 passed and 35 skipped; the skipped tests are opt-in checks against frozen snapshots
-(`experiments/015-final-frontier/build-v3` and `build-v5`) that are not part of this repository.
+The application tests run offline, with engineering embedding doubles. The 037 application was
+verified locally with 1022 passed and 35 existing skipped tests; the public export is checked again
+before publication. This is engineering validation, not an AML score or a Full capacity guarantee.
+The skipped tests require opt-in historical build-v3/build-v5 snapshots absent from this repository.
 
-`tests/test_optional_adversarial.py` binds the application sources to recorded source identities.
-The files under `experiments/` are that chain: earlier source snapshots and their hash manifests
-(`experiments/027-coordinator-lock-wait/candidate-origin.json` is the current one). They contain code
-and hashes only.
+`tests/test_optional_adversarial.py` checks the source identity chain. Public manifests include the
+030/031/036 ancestors and `experiments/037-retrieval-performance/candidate-final.json`; the current
+29 application files must match that manifest. Historical manifests retain their original identity.
+The frozen 037 `baseline/app/segments.py` is included for the performance equivalence regression.
 
 ## Data handling
 
 Benchmark data is not included in this repository. The service stores only what the platform sends
 to `/add`, in a single SQLite database (`/var/lib/aml/aml-hybrid.sqlite` in the server deployment).
-Evaluation data is deleted within 30 days after the task by removing that database (with its
-`-wal`/`-shm` files) and its backups under `/var/backups/aml/`.
+Operators must delete evaluation data within 30 days after the task by removing that database
+(with its `-wal`/`-shm` files) and its backups under `/var/backups/aml/`. This is an operational
+retention requirement; automatic cleanup is not implemented. Preserve acknowledged memory
+and indexes throughout an interrupted evaluation and its recovery.
 
-## Status
+## Release and deployment status
 
-No official leaderboard result has been published for this configuration yet.
+This repository now includes the locally verified 037 concurrency/performance candidate,
+`cycle2-exact-retrieval-performance-v2`. Its manifest SHA256 is
+`bf78e687f3485f2403365034c57849226b6a32257c204ec9615e9f0d8cb2f66e`.
+Publishing this code does not deploy it. The existing public service was originally released
+from commit `c37de8791805227fa43181bdf0013e2e6f7a33c7` (027); its current source identity
+must be verified by the operator before claiming an exact deployed commit. A health/config
+hash alone does not prove application source identity.
+
+For an access request concerning that old deployment, use the fixed old commit and the
+[027 submission notes](SUBMISSION-hybrid-027.md), after verifying the server matches it.
+Do not identify the new main branch as deployed until the operator has deployed and verified it.
+
+The 037 changes serialize per-user preparation and reduce repeated readiness-count and exact
+dense-scoring work. Six final local mixed-load rounds completed 384/384 request positions;
+measured mixed-load Search p95 remained about 27-29 seconds for FTS and 98-103 seconds for
+Hybrid. These were local handlers with cached real vectors, not public HTTP or live supplier
+capacity tests. Production model dispatch can still be billed twice if a supplier processes a
+request before local persistence fails; request-id idempotency is not exactly-once billing.
+
+The research configuration `cycle2_raw` / `raw_fts` uses no embedding or LLM API. A small local
+unseen-source comparison favored keeping FTS as a cost-first candidate and Hybrid optional;
+this does not establish FTS as universally better. The supplied `deploy.start`/`deploy.runtime`
+launcher still requires a formal dense configuration and cannot launch FTS merely by changing
+the two profile/mode variables. A compatible production entry point must be provided and
+verified before deploying FTS. LLM extraction remains optional and disabled by default.
+
+No official Smoke/Full result is established by this release. The operator handles deployment,
+capacity verification, and official evaluation separately. Existing confirmed raw data, indexes,
+request receipts and accounting state must be backed up and retained during upgrades.
 
 ## Attribution
 
@@ -93,7 +124,7 @@ No official leaderboard result has been published for this configuration yet.
 - Runtime libraries: FastAPI, Starlette, Uvicorn, Pydantic, HTTPX, NumPy (versions in
   `our-system/requirements-cycle2.txt`).
 
-- HTTP contract and evaluation: the AML [API guide](https://agentmemoryleaderboard.ai/api-guide) and
+- HTTP contract and evaluation: the AML [API guide](https://agentmemories.ai/api-guide) and
   [official harness](https://github.com/AML-memory/agent-memory-leaderboard).
 
 The public memory systems below were studied at the listed revisions. Their mechanisms were
@@ -101,11 +132,11 @@ reimplemented; no third-party source code is included.
 
 | Project | Revision studied | Mechanisms that informed MemPrism |
 |---|---|---|
-| [InvMem](https://github.com/wenxiaof345-ctrl/vanilla-rag-memory) | `31ab7bf9` | Per-user lexical + dense retrieval fused with RRF (deployed). Query/option views, context windows (experimental, off). |
-| [ActiveMemoryIndex](https://github.com/linxuhao/ActiveMemoryIndex) | `9bb0497c` | Store raw messages first; per-user idempotent Add (deployed). Derived facts, single rewrite (experimental, off). |
-| [Mem0](https://github.com/mem0ai/mem0) | `94c3fe9f` | Explicit user scoping (deployed). Change history, thresholds (experimental, off). |
-| [MemMachine](https://github.com/MemMachine/MemMachine) | `d57f5cb3` | Index representation kept separate from returned source text (deployed). Context expansion (experimental, off). |
-| [memfusion](https://github.com/huangpengtao00-dotcom/memfusion-memory) | `8578b646` | Fusion rank kept separate from relevance score (deployed). Query expansion (experimental, off). |
+| [InvMem](https://github.com/wenxiaof345-ctrl/vanilla-rag-memory) | `31ab7bf9` | Per-user lexical + dense retrieval fused with RRF (027 template; retained in code). Query/option views, context windows (experimental, off). |
+| [ActiveMemoryIndex](https://github.com/linxuhao/ActiveMemoryIndex) | `9bb0497c` | Store raw messages first; per-user idempotent Add (027 template; retained in code). Derived facts, single rewrite (experimental, off). |
+| [Mem0](https://github.com/mem0ai/mem0) | `94c3fe9f` | Explicit user scoping (027 template; retained in code). Change history, thresholds (experimental, off). |
+| [MemMachine](https://github.com/MemMachine/MemMachine) | `d57f5cb3` | Index representation kept separate from returned source text (027 template; retained in code). Context expansion (experimental, off). |
+| [memfusion](https://github.com/huangpengtao00-dotcom/memfusion-memory) | `8578b646` | Fusion rank kept separate from relevance score (027 template; retained in code). Query expansion (experimental, off). |
 | [ChronoHybridMem](https://github.com/Tin11Mn/chrono-hybrid-mem) | `a8411527` | Query plans, support witnesses, temporal views (experimental, off). |
 | [M-flow](https://github.com/FlowElement-xinliuyuansu/m_flow) | `0d585cda` | Typed routing, episode/facet structure, procedures (experimental, off). |
 | [agent-memory-leaderboard-2026](https://github.com/cenjoy/agent-memory-leaderboard-2026) | `553f9c96` | Type-aware replacement vs. coexistence, privacy gate position (experimental, off). |

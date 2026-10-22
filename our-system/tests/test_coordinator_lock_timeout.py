@@ -23,10 +23,12 @@ def _clear_aml_env(monkeypatch) -> None:
             monkeypatch.delenv(name, raising=False)
 
 
-def test_default_coordinator_lock_timeout_is_point_one(tmp_path) -> None:
+def test_default_coordinator_lock_timeout_is_thirty_seconds(monkeypatch, tmp_path) -> None:
+    _clear_aml_env(monkeypatch)
     settings = Settings(db_path=tmp_path / "defaults.db")
     settings.ensure_phase_a_defaults()
-    assert settings.coordinator_lock_timeout_seconds == 0.1
+    assert settings.coordinator_lock_timeout_seconds == 30.0
+    assert Settings.from_env().coordinator_lock_timeout_seconds == 30.0
 
 
 def test_coordinator_lock_timeout_from_env(monkeypatch, tmp_path) -> None:

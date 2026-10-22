@@ -32,6 +32,12 @@ def create_app(
     if resolved.vector_enabled or "dense" in resolved.required_routes:
         provider = embedding_provider or (create_embedding_provider(resolved.embedding) if resolved.embedding else None)
     profile = Profile.build(resolved, provider)
+    if resolved.formal and provider is not None:
+        from app.embedding_accounting import AccountedEmbeddingProvider
+        if not isinstance(provider, AccountedEmbeddingProvider):
+            provider = AccountedEmbeddingProvider(provider,
+                resolved.db_path.with_name(resolved.db_path.name + '.embedding-usage.sqlite'),
+                scope_identity=profile.config_hash)
     if resolved.enable_extractor:
         from app.atomic_memory import AtomicMemoryConfig,HttpAtomProvider
         atom_provider=atom_provider or HttpAtomProvider(AtomicMemoryConfig.from_settings(resolved))

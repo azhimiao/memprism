@@ -55,6 +55,12 @@ class IngestService:
         self._request_locks = [threading.Lock() for _ in range(64)]
 
     def add(self, request: AddRequest) -> AddResponse:
+        from app.embedding_accounting import embedding_scope
+        with embedding_scope(request.user_id,
+                request.request_id + ':' + canonical_payload_hash(request), 'add'):
+            return self._add_scoped(request)
+
+    def _add_scoped(self, request: AddRequest) -> AddResponse:
         if self.coordinator is not None:
             return self._formal_add(request)
         lock = self._request_locks[hash((request.user_id, request.request_id)) % len(self._request_locks)]

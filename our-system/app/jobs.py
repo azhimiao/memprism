@@ -21,6 +21,7 @@ from app.index import build_lexical_text
 LEASE_TTL = 60.0
 RENEW_INTERVAL = 20.0
 COMPETITION_WAIT = 5.0
+USER_PREPARATION_WAIT = 120.0
 
 
 class NotReady(RuntimeError):
@@ -199,15 +200,16 @@ def write_publication_on(db, user_id, request_id, profile=None):
 
 
 class JobCoordinator:
-    def __init__(self, store, profile, *, lock_timeout_seconds: float = 0.1):
+    def __init__(self, store, profile, *, lock_timeout_seconds: float = 30.0):
         self.store, self.profile = store, profile
         self.lock_timeout_seconds = lock_timeout_seconds
 
     @contextmanager
-    def transaction(self, write=True):
+    def transaction(self, write=True, *, timeout_seconds=None):
         db = None
         try:
-            db = self.store._connect(timeout=self.lock_timeout_seconds)
+            timeout = self.lock_timeout_seconds if timeout_seconds is None else min(self.lock_timeout_seconds, timeout_seconds)
+            db = self.store._connect(timeout=timeout)
             db.execute("BEGIN IMMEDIATE" if write else "BEGIN")
             yield db
             db.execute("COMMIT")
@@ -294,10 +296,34 @@ class JobCoordinator:
             return {"proof_id": proof_id, "config_generation": generation, "epoch": epoch,
                     "commit_seq": seq, "counts": counts, "config_hash": self.profile.config_hash}
 
+    @contextmanager
+    def _reservation_transaction(self, deadline):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise NotReady("preparation_busy")
+        try:
+            with self.transaction(timeout_seconds=remaining) as db:
+                yield db
+        except NotReady as exc:
+            cause = exc.__context__
+            code = getattr(cause, "sqlite_errorcode", 0) or 0
+            if (isinstance(cause, sqlite3.Error) and code & 255 in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
+                    and time.monotonic() >= deadline):
+                raise NotReady("preparation_busy") from None
+            raise
+
     def reserve(self, user_id, request_id, payload_hash, *, pure_control=False, messages=None, response=None):
         deadline = time.monotonic() + COMPETITION_WAIT
+        user_deadline = time.monotonic() + USER_PREPARATION_WAIT
+        serialized = self.profile.identity.get("add_preparation_policy") == "user_lease_v1" and not pure_control
+        wait_deadline = user_deadline if serialized else deadline
         while True:
-            with self.transaction() as db:
+            remaining = wait_deadline - time.monotonic()
+            if remaining <= 0:
+                raise NotReady("preparation_busy")
+            with self._reservation_transaction(wait_deadline) as db:
+                if time.monotonic() >= wait_deadline:
+                    raise NotReady("preparation_busy")
                 receipt = db.execute("SELECT * FROM add_requests WHERE user_id=? AND request_id=?",
                                      (user_id, request_id)).fetchone()
                 job = db.execute("SELECT * FROM k0_jobs WHERE user_id=? AND request_id=?", (user_id, request_id)).fetchone()
@@ -312,29 +338,47 @@ class JobCoordinator:
                     if legacy_rows and not _legacy_rows_match(legacy_rows, messages):
                         raise PayloadConflict("request_id has already been used with a different Add payload")
                 generation = self.config_on(db)
-                if not pure_control:
-                    self.ready_on(db, user_id)
-                if receipt:
-                    return json.loads(receipt["response_json"])
-                if legacy_rows:
-                    # Reconcile the old wire ledger only after current-route
-                    # proof; never rewrite original route proof or embed replay.
-                    db.execute("INSERT INTO add_requests VALUES (?,?,?,?,?)", (
-                        user_id, request_id, payload_hash, json.dumps(response, sort_keys=True, ensure_ascii=False),
-                        messages[0].recorded_at))
-                    return response
                 now = time.time()
-                if not job or job["state"] != "preparing" or job["expires_at"] <= now or job["config_generation"] != generation:
-                    owner = uuid.uuid4().hex
-                    fence = job["generation"] + 1 if job else 1
-                    epoch = epoch_on(db, user_id)
-                    db.execute("INSERT OR REPLACE INTO k0_jobs VALUES (?,?,?,?,?,?,?,?,?,?,NULL)", (
-                        user_id, request_id, payload_hash, self.profile.config_hash, generation,
-                        owner, fence, now + LEASE_TTL, epoch, "preparing"))
-                    return Lease(user_id, request_id, payload_hash, owner, fence, generation, epoch)
-            if time.monotonic() >= deadline:
+                # Competing app instances share this durable lease. Preparing
+                # two different Adds for one user wastes work: publication of
+                # either invalidates the other's source epoch. Wait BEFORE any
+                # model work. Exact erase controls must still preempt a lease.
+                other = None
+                own_preparing = (job and job["state"] == "preparing" and job["expires_at"] > now
+                                 and job["config_generation"] == generation)
+                if serialized and not receipt and not legacy_rows and not own_preparing:
+                    other = db.execute("""SELECT 1 FROM k0_jobs WHERE user_id=? AND request_id!=?
+                        AND state='preparing' AND expires_at>? AND config_generation=?
+                        AND config_hash=? AND source_epoch=? LIMIT 1""",
+                        (user_id, request_id, now, generation, self.profile.config_hash, epoch_on(db, user_id))).fetchone()
+                if other:
+                    wait_deadline = user_deadline
+                else:
+                    if not pure_control:
+                        self.ready_on(db, user_id)
+                    if receipt:
+                        return json.loads(receipt["response_json"])
+                    if legacy_rows:
+                        # Reconcile only after current-route proof; no embedding.
+                        db.execute("INSERT INTO add_requests VALUES (?,?,?,?,?)", (
+                            user_id, request_id, payload_hash, json.dumps(response, sort_keys=True, ensure_ascii=False),
+                            messages[0].recorded_at))
+                        return response
+                    now = time.time()
+                    if not job or job["state"] != "preparing" or job["expires_at"] <= now or job["config_generation"] != generation:
+                        if time.monotonic() >= wait_deadline:
+                            raise NotReady("preparation_busy")
+                        owner = uuid.uuid4().hex
+                        fence = job["generation"] + 1 if job else 1
+                        epoch = epoch_on(db, user_id)
+                        db.execute("INSERT OR REPLACE INTO k0_jobs VALUES (?,?,?,?,?,?,?,?,?,?,NULL)", (
+                            user_id, request_id, payload_hash, self.profile.config_hash, generation,
+                            owner, fence, now + LEASE_TTL, epoch, "preparing"))
+                        return Lease(user_id, request_id, payload_hash, owner, fence, generation, epoch)
+                    wait_deadline = min(wait_deadline, deadline)
+            if time.monotonic() >= wait_deadline:
                 raise NotReady("preparation_busy")
-            time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+            time.sleep(min(0.05, max(0, wait_deadline - time.monotonic())))
 
     def fence_on(self, db, lease, *, published=False):
         generation = self.config_on(db)

@@ -420,10 +420,17 @@ def test_config_change_abandons_generation_and_rejects_old_completion(tmp_path):
 def test_renewal_failure_prevents_next_batch(tmp_path, monkeypatch):
     import app.jobs as jobs
     monkeypatch.setattr(jobs, "RENEW_INTERVAL", 0.01)
-    provider = Provider(action=lambda: time.sleep(0.05))
+    entered = threading.Event()
+    def first_dispatch():
+        entered.set()
+        time.sleep(0.05)
+    provider = Provider(action=first_dispatch)
     provider.config = replace(provider.config, batch_size=1)
     app = app_at(tmp_path / "m.db", provider)
     def lose(lease):
+        # Trigger the fault during the first provider call, independently of
+        # startup/accounting I/O. The second batch must never be dispatched.
+        assert entered.wait(3)
         raise NotReady("renewal_fault")
     monkeypatch.setattr(app.state.coordinator, "renew", lose)
     assert add(app, contents=("alpha", "beta")).status_code == 503

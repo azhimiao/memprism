@@ -34,7 +34,7 @@ class Settings:
     auth_mode: str = "none"
     service_key_env: str = "AML_SERVICE_API_KEY"
     max_concurrent_requests: int = 16
-    coordinator_lock_timeout_seconds: float = 0.1
+    coordinator_lock_timeout_seconds: float = 30.0
     max_request_bytes: int = 10485760
     profile_id: str = "research"
     packing_policy: str = "prefix"
@@ -124,7 +124,7 @@ class Settings:
                    service_key_env=os.environ.get("AML_SERVICE_KEY_ENV", "AML_SERVICE_API_KEY"),
                    max_concurrent_requests=int(os.environ.get("AML_MAX_CONCURRENT_REQUESTS", "16")),
                    coordinator_lock_timeout_seconds=float(
-                       os.environ.get("AML_COORDINATOR_LOCK_TIMEOUT_SECONDS", "0.1")),
+                       os.environ.get("AML_COORDINATOR_LOCK_TIMEOUT_SECONDS", "30")),
                    max_request_bytes=int(os.environ.get("AML_MAX_REQUEST_BYTES", "10485760")),
                    packing_policy=os.environ.get('AML_PACKING_POLICY','prefix'),
                    return_token_budget=int(os.environ['AML_RETURN_TOKEN_BUDGET']) if os.environ.get('AML_RETURN_TOKEN_BUDGET') else (65536 if profile.startswith('cycle2_') else None),

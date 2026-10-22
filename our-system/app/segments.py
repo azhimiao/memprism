@@ -12,6 +12,8 @@ import hashlib
 import json
 import math
 import re
+import sys
+import threading
 
 import tiktoken
 
@@ -207,8 +209,35 @@ def valid_candidate(db, candidate, source):
         row["span_sha256"] == candidate.span_sha256 == digest(candidate.content))
 
 
+# Cache only five counts and a digest, never source text, vectors or permissions.
+# Every lookup fingerprints ALL current values used below in the caller's SQLite
+# snapshot. Out-of-band edits without epoch/commit changes therefore miss too.
+_counts_cache = OrderedDict()
+_counts_lock = threading.Lock()
+_COUNTS_CACHE_LIMIT = 128
+_COUNTS_CACHE_MAX_BYTES = 128 * 1024
+_counts_cache_bytes = 0
+
+
+def _counts_key(groups):
+    h = hashlib.sha256()
+    for group in groups:
+        h.update(b"group")
+        for row in group:
+            # sqlite3 scalar values have unambiguous tuple reprs (including
+            # escaped strings, bytes, None and number types). Row-length framing
+            # prevents separator ambiguity. Formatting runs in C rather than
+            # invoking Python/hashlib for every field on every readiness call.
+            encoded = repr(tuple(row)).encode("utf-8")
+            h.update(len(encoded).to_bytes(8, "big"))
+            h.update(encoded)
+        h.update(b"endgroup")
+    return h.digest()
+
+
 def counts(db, user_id, profile):
     """Expected spans come from raw sources, so missing rows cannot look ready."""
+    global _counts_cache_bytes
     rows = db.execute("""SELECT m.*,p.source_version,p.content_sha256 AS policy_hash
         FROM raw_messages m LEFT JOIN source_policies p ON m.id=p.raw_id AND m.user_id=p.user_id
         WHERE m.user_id=? AND m.deletion_state='active'""", (user_id,)).fetchall()
@@ -226,6 +255,18 @@ def counts(db, user_id, profile):
     saved_vectors = {r["span_id"]: r for r in db.execute(
         "SELECT * FROM span_vectors WHERE user_id=? AND embedding_version=? AND dimensions=?",
         (user_id, profile.model_version, profile.dimensions))}
+    key = _counts_key((
+        [(user_id, profile.model_version, profile.dimensions, fragment_hash())],
+        (tuple(r) for r in rows),
+        (tuple(r.values()) for r in saved_spans.values()),
+        ((span_id, *values) for span_id, values in fts.items()),
+        (tuple(r) for r in saved_vectors.values()),
+    ))
+    with _counts_lock:
+        cached = _counts_cache.get(key)
+        if cached is not None:
+            _counts_cache.move_to_end(key)
+            return dict(cached[0])
     expected_ids=set();invalid_raw=False
     for raw in rows:
         expected = split_source(raw, raw["source_version"] or 1)
@@ -254,6 +295,23 @@ def counts(db, user_id, profile):
         result["fts"]=-1
     if invalid_raw:
         result["raw"]=-1
+    with _counts_lock:
+        value = tuple(result.items())
+        # Charge all recursively retained objects plus a conservative 256-byte
+        # allowance for the mapping node/value wrapper (shared strings charged
+        # each time). Both entries and accounted bytes are bounded.
+        size = sys.getsizeof(key) + sys.getsizeof(value) + 256 + sum(
+            sys.getsizeof(pair) + sum(sys.getsizeof(v) for v in pair) for pair in value)
+        old = _counts_cache.pop(key, None)
+        if old is not None:
+            _counts_cache_bytes -= old[1]
+        if size <= _COUNTS_CACHE_MAX_BYTES:
+            _counts_cache[key] = (value, size)
+            _counts_cache_bytes += size
+        while (len(_counts_cache) > _COUNTS_CACHE_LIMIT or
+               _counts_cache_bytes > _COUNTS_CACHE_MAX_BYTES):
+            _, (_, removed_size) = _counts_cache.popitem(last=False)
+            _counts_cache_bytes -= removed_size
     return result
 
 
@@ -300,8 +358,16 @@ def search(db, user_id, match_query, query_vector, version, dimensions, mode, ca
             for row in rows:
                 if row["vector_hash"] != digest(row["content"]):
                     raise ValueError("stale_span_vector")
-            if exact_acceleration:
+            # Exact scores/order are unchanged. Use bounded vectorized screening
+            # by default when the optional numerical dependency is available.
+            # Explicit opt-in retains its existing missing-dependency failure.
+            try:
                 from app.exact_dense import exact_top_scores
+            except ImportError:
+                if exact_acceleration:
+                    raise
+                exact_top_scores = None
+            if exact_top_scores is not None:
                 scores = exact_top_scores([r['vector_json'] for r in rows], query_vector, dimensions,
                     dense_quota if mode == 'raw_hybrid_rrf' else candidate_limit,
                     [(r['message_index'], r['span_start'], r['id']) for r in rows])
