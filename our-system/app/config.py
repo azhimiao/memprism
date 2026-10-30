@@ -39,6 +39,7 @@ class Settings:
     profile_id: str = "research"
     packing_policy: str = "prefix"
     return_token_budget: int | None = None
+    retrieval_policy: str = "legacy"
     route_policy: str = "none"
     source_labels: bool = False
     unknown_dense_floor: float | None = None
@@ -81,6 +82,8 @@ class Settings:
             base += ("sentence",)
         if self.enable_extractor:
             base += ("atom",)
+        if self.retrieval_policy == "evidence_architecture_v1":
+            base += ("catalog",)
         return base
 
     @property
@@ -112,6 +115,7 @@ class Settings:
                     max_retries=int(os.environ.get("AML_EMBEDDING_MAX_RETRIES", "0")),
                 )
         return cls(db_path=db_path, retrieval_mode=mode, enable_vector=enable, embedding=embedding, profile_id=profile,
+                   retrieval_policy=os.environ.get('AML_RETRIEVAL_POLICY', 'legacy'),
                    enable_governance=os.environ.get("AML_ENABLE_GOVERNANCE", "false").lower() == "true",
                    context_neighbor_radius=int(os.environ.get("AML_CONTEXT_NEIGHBOR_RADIUS", "0")),
                    candidate_limit=int(os.environ.get("AML_CANDIDATE_LIMIT", "200")),
@@ -153,6 +157,10 @@ class Settings:
                    unknown_dense_floor=float(os.environ['AML_UNKNOWN_DENSE_FLOOR']) if os.environ.get('AML_UNKNOWN_DENSE_FLOOR') else None)
 
     def ensure_phase_a_defaults(self) -> None:
+        if self.retrieval_policy not in {"legacy", "evidence_units_v1", "evidence_architecture_v1"}:
+            raise ValueError("unknown retrieval policy")
+        if self.retrieval_policy != "legacy" and self.fragment_policy != "span_exact_v1":
+            raise ValueError("evidence units require an explicit span profile")
         if self.profile_id not in {"research", "raw_sync", "dense_sync", "span_sync", "span_dense_sync", "cycle2_raw", "cycle2_dense"}:
             raise ValueError("unknown profile")
         if self.profile_id in {"raw_sync", "span_sync"} and (self.vector_enabled or self.embedding is not None):

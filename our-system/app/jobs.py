@@ -138,6 +138,9 @@ def route_counts_on(db, user_id, profile):
     if profile.identity["profile_version"] == "k1-v1":
         from app.segments import counts
         result=counts(db,user_id,profile)
+        if 'catalog' in profile.required_routes:
+            from app.evidence_catalog import ready as catalog_ready
+            result['catalog'] = result['active'] if catalog_ready(db,user_id,profile.config_hash) else -1
         if 'sentence' in profile.required_routes:
             from app.evidence_navigation import counts as sentence_counts
             raw_count=db.execute("SELECT COUNT(*) FROM raw_messages WHERE user_id=? AND deletion_state='active'",(user_id,)).fetchone()[0]
@@ -189,6 +192,9 @@ def write_publication_on(db, user_id, request_id, profile=None):
     if profile is None:
         return
     epoch, seq = epoch_on(db, user_id), seq_on(db, user_id)
+    if 'catalog' in profile.required_routes:
+        from app.evidence_catalog import certify_on
+        certify_on(db,user_id,profile.config_hash)
     counts = route_counts_on(db, user_id, profile)
     for route in profile.required_routes:
         ready = counts[route] == counts["active"] and (route != "dense" or profile.dimensions > 0)
@@ -504,6 +510,9 @@ class JobCoordinator:
                                  source["content_sha256"] == digest(candidate.content))
                 if candidate.representation == "span_exact_v1":
                     content_valid = valid_candidate(db,candidate,source)
+                elif candidate.representation == "evidence_block_v1":
+                    from app.evidence_catalog import valid_candidate as valid_block
+                    content_valid = valid_block(db,candidate,source)
                 if (not source or not old or source["source_version"] != old.version or
                     source["deletion_state"] != "active" or not content_valid or
                     source["visibility"] != old.visibility or source["disclosure_policy"] != old.disclosure_policy or

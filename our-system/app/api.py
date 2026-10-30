@@ -9,12 +9,13 @@ from app.embeddings import EmbeddingProvider, create_embedding_provider
 from app.governance import GovernancePolicy, PassthroughGovernance, BoundedGovernance
 from app.ingest import IngestService, RequestPayloadConflict
 from app.models import AddRequest, AddResponse, SearchRequest, SearchResponse
-from app.retrieval import RetrievalService, LifecycleSnapshotBusy
+from app.retrieval import RetrievalService, LifecycleSnapshotBusy, InvalidSearchInput
 from app.store import SqliteStore
 from app.transport import TransportGuard
 from app.profiles import Profile
 from app.jobs import JobCoordinator, NotReady
 import sqlite3
+from app import diagnostics as diagnostic
 
 
 def create_app(
@@ -93,34 +94,50 @@ def create_app(
 
     @app.post("/add", response_model=AddResponse)
     def add_messages(body: AddRequest) -> AddResponse:
+        diagnostic.stage('add')
         try:
             return ingest.add(body)
         except RequestPayloadConflict as exc:
+            diagnostic.failure(exc, 'request_payload_conflict')
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except NotReady as exc:
+            diagnostic.failure(exc, str(exc))
             raise HTTPException(status_code=503, detail=str(exc), headers={"Retry-After": "1"}) from exc
         except sqlite3.Error as exc:
+            diagnostic.failure(exc, 'control_not_ready')
             if coordinator is None:
                 raise
             raise HTTPException(status_code=503, detail="control_not_ready", headers={"Retry-After": "1"}) from exc
         except Exception as exc:
+            diagnostic.failure(exc, 'preparation_failed')
             if coordinator is None:
                 raise
             raise HTTPException(status_code=503, detail="preparation_failed", headers={"Retry-After": "1"}) from None
 
     @app.post("/search", response_model=SearchResponse)
     def search_messages(body: SearchRequest, response: Response) -> SearchResponse:
+        diagnostic.stage('search')
+        diagnostic.emit('input_shape', query_chars=len(body.query),
+                        query_utf8_bytes=len(body.query.encode('utf-8', errors='replace')),
+                        option_count=len(body.options or []))
         try:
             result, trace = retrieval.search_with_trace(body)
+        except InvalidSearchInput as exc:
+            diagnostic.failure(exc, str(exc))
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         except LifecycleSnapshotBusy as exc:
+            diagnostic.failure(exc, 'lifecycle snapshot busy')
             raise HTTPException(status_code=503,detail="lifecycle snapshot busy",headers={"Retry-After":"1"}) from exc
         except NotReady as exc:
+            diagnostic.failure(exc, str(exc))
             raise HTTPException(status_code=503, detail=str(exc), headers={"Retry-After": "1"}) from exc
         except sqlite3.Error as exc:
+            diagnostic.failure(exc, 'control_not_ready')
             if coordinator is None:
                 raise
             raise HTTPException(status_code=503, detail="control_not_ready", headers={"Retry-After": "1"}) from exc
         except Exception as exc:
+            diagnostic.failure(exc, 'search_failed')
             if coordinator is None:
                 raise
             raise HTTPException(status_code=503, detail="search_failed", headers={"Retry-After": "1"}) from None

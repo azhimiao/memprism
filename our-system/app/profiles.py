@@ -59,6 +59,10 @@ class Profile:
                             capability_mechanism_version='e38-candidate-v3')
         if settings.temporal_source_dates:
             identity.update(temporal_source_dates=True, temporal_date_renderer='query_source_date_v1')
+        if settings.retrieval_policy != "legacy":
+            identity.update(retrieval_policy=settings.retrieval_policy,
+                            retrieval_policy_version=("source_directory_groups_062_v1" if settings.retrieval_policy == "evidence_architecture_v1"
+                                                      else "balanced_structural_budget_v1"))
         if settings.profile_id.startswith('cycle2_'):
             identity.update(cycle2_version='dual-evidence-v1', sentence_index=settings.sentence_index,
                 add_preparation_policy='user_lease_v1', user_preparation_wait_seconds=120,

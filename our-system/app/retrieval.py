@@ -12,13 +12,15 @@ from typing import Protocol
 from pathlib import Path
 
 from app.config import Settings
-from app.embeddings import EmbeddingFailure, EmbeddingProvider, normalize_vector, provider_version
+from app.embeddings import EmbeddingFailure, EmbeddingProvider, embed_retrieval_query, normalize_vector, provider_version
 from app.index import build_match_query
 from app.models import EvidenceCandidate, SearchHit, SearchRequest, SearchResponse
 from app.safety import filter_evidence
 from app.governance import temporal_view
 from app.store import MessageStore
 from app.jobs import NotReady, SnapshotChanged
+from app import diagnostics as diagnostic
+from app.evidence_budget import InvalidSearchInput
 
 
 class LifecycleSnapshotBusy(RuntimeError):
@@ -185,6 +187,7 @@ class RetrievalService:
         discarded = []
         request_generation = None
         for attempt in range(self.coordinator.profile.identity['search_attempts']):
+            diagnostic.stage('readiness_before_search')
             stamp = self.coordinator.require_ready(request.user_id)
             if request_generation is None:
                 request_generation = stamp[0]
@@ -196,6 +199,8 @@ class RetrievalService:
                 return self._search_once(request, stamp=stamp, formal_attempt=attempt+1,
                                          prior_revocations=discarded)
             except SnapshotChanged as exc:
+                diagnostic.stage('snapshot_retry')
+                diagnostic.emit('snapshot_retry', exc=exc, attempt=attempt+1, reason=str(exc))
                 record = dict(getattr(exc, "dispatch_trace", None) or {})
                 record.setdefault("reason", str(exc))
                 record.setdefault("inflight_recall", False)
@@ -204,10 +209,19 @@ class RetrievalService:
         raise LifecycleSnapshotBusy("lifecycle changed during final evidence check")
 
     def _search_once(self, request, *, stamp=None, formal_attempt=1, prior_revocations=()):
+        diagnostic.stage('query_parse')
         started = time.perf_counter()
         plan = parse_query(request)
-        match_query = build_match_query(plan.query_text)
         settings, provider = self.settings, self.embedding_provider
+        architecture_active = settings.retrieval_policy == "evidence_architecture_v1"
+        units_active = settings.retrieval_policy in {"evidence_units_v1", "evidence_architecture_v1"}
+        match_query = (build_match_query(plan.query_text, policy="balanced_v1") if units_active
+                       else build_match_query(plan.query_text))
+        input_budget_trace = None
+        token_budget = settings.return_token_budget
+        if units_active:
+            from app.evidence_budget import evidence_budget
+            token_budget, input_budget_trace = evidence_budget(plan.query_text, plan.options, token_budget)
         from app.queryplan import allocate_index_budget,plan_query,scale_option_queries,typed_order
         capability_plan=plan_query(plan.query_text,plan.options)
         adaptive_trace=None
@@ -224,6 +238,11 @@ class RetrievalService:
         planned_hits=allocate_index_budget(settings.candidate_limit,options_active=options_active,
             sentence=settings.sentence_index,bridge=bool(settings.bridge_hops),atom=settings.enable_extractor,
             option_total=option_total)
+        catalog_quota = 0
+        if architecture_active:
+            catalog_quota = min(64,planned_hits['original']//3)
+            planned_hits['original'] -= catalog_quota
+            planned_hits['catalog'] = catalog_quota
         original_limit=planned_hits["original"]
         sentence_quota=planned_hits["sentence"]
         bridge_quota=planned_hits["bridge"]
@@ -242,6 +261,7 @@ class RetrievalService:
         if mode != "raw_fts":
             if provider is None:
                 reason = "missing_configuration"
+            diagnostic.stage('vector_coverage')
             total, ready = self.store.vector_coverage(plan.user_id, version, dimensions,
                 **({"span":True} if settings.fragment_policy == "span_exact_v1" else {}))
             if total:
@@ -259,30 +279,38 @@ class RetrievalService:
                                 # Readiness/configuration checks still run before
                                 # every dispatch (including provider retries).
                                 nonlocal stamp
+                                diagnostic.stage('readiness_before_embedding')
                                 fresh_stamp = self.coordinator.require_ready(plan.user_id)
                                 if fresh_stamp[0] != stamp[0]:
                                     raise NotReady('query_config_generation_changed')
                                 stamp = fresh_stamp
                             check_dispatch()
-                            batch = provider.embed_guarded([plan.query_text], before_dispatch=check_dispatch) if hasattr(provider, "embed_guarded") else provider.embed([plan.query_text])
+                            diagnostic.stage('embedding')
+                            batch = embed_retrieval_query(provider, plan.query_text, before_dispatch=check_dispatch)
                         else:
-                            batch = provider.embed([plan.query_text])
+                            diagnostic.stage('embedding')
+                            batch = embed_retrieval_query(provider, plan.query_text)
                         usage = batch.usage
                         if len(batch.vectors) != 1:
                             raise EmbeddingFailure("response_count_mismatch", usage)
                         query_vector = normalize_vector(batch.vectors[0], dimensions)
                     except EmbeddingFailure as exc:
+                        diagnostic.failure(exc, exc.code)
+                        if units_active and (exc.usage or {}).get('query_window_budget_exceeded'):
+                            raise InvalidSearchInput('query_window_budget_exceeded') from exc
                         reason, usage = exc.code, exc.usage or usage
         if self.coordinator is not None and reason:
             raise NotReady(reason)
         if self.coordinator is not None:
             # Start the evidence snapshot after the slow remote computation.
+            diagnostic.stage('readiness_after_embedding')
             # Add200 before this point must be visible; changes while evidence
             # is selected still fail the unchanged final/source checks below.
             fresh_stamp = self.coordinator.require_ready(plan.user_id)
             if fresh_stamp[0] != stamp[0]:
                 raise NotReady('query_config_generation_changed')
             stamp = fresh_stamp
+        diagnostic.stage('search_snapshot')
         snapshot = self.store.search_snapshot(
             user_id=plan.user_id, match_query=match_query, query_vector=query_vector,
             version=version, dimensions=dimensions, mode=mode,
@@ -299,6 +327,7 @@ class RetrievalService:
                 # a query vector; never turn it into a fake empty/FTS success.
                 raise SnapshotChanged("first_add_during_query_preparation")
             raise NotReady(snapshot.degraded_reason)
+        diagnostic.stage('evidence_selection')
         unknown_dropped=0
         if settings.unknown_dense_floor is not None:
             allowed=[h for h in snapshot.dense if h.score>=settings.unknown_dense_floor]
@@ -406,14 +435,50 @@ class RetrievalService:
             window_trace['disabled_by_temporal_view']=downgraded
             authorized={sid for group in window_trace['groups'] for sid in group['member_ids']}
             fused=[hit for hit in fused if hit.id in independent_ids or hit.id in authorized]
+        from app.rendering import render_span_source, render_source_date, should_show_source_dates
+        renderer=render_span_source if settings.source_labels else None
+        from app.evidence_budget import state_time_query
+        dates_active = settings.temporal_source_dates and (should_show_source_dates(plan.query_text)
+            or (units_active and state_time_query(plan.query_text)))
+        if dates_active:
+            renderer = render_source_date
+        if settings.metadata_roles or settings.metadata_dates:
+            from app.rendering import render_metadata
+            renderer=lambda candidate:render_metadata(candidate,roles=settings.metadata_roles,dates=settings.metadata_dates)
+        unit_trace = {'enabled': False}
+        if units_active and not architecture_active:
+            fused, unit_groups, unit_trace = self.store.expand_evidence_units(
+                plan.user_id, fused, limit=settings.candidate_limit,
+                group_item_limit=min(request.top_k, settings.max_return_items),
+                group_char_limit=settings.return_char_budget,
+                group_token_limit=token_budget, renderer=renderer)
+            window_trace['groups'].extend(unit_groups)
+            unit_trace['enabled'] = True
         seeds = fused
+        base_groups = list(window_trace['groups'])
         for snapshot_attempt in range(3):
             fused = self.store.governed_candidates(plan.user_id,seeds,view,settings.candidate_limit) if settings.enable_governance else seeds
+            if architecture_active:
+                selected, unit_groups, unit_trace = self.store.assemble_catalog_evidence(
+                    plan.user_id, fused, plan.query_text, limit=settings.candidate_limit,
+                    max_items=min(request.top_k,settings.max_return_items),recall_limit=catalog_quota,
+                    char_limit=settings.return_char_budget,token_limit=token_budget,renderer=renderer)
+                if settings.enable_governance:
+                    selected = type(fused)(selected,fused.lifecycle_epoch,getattr(fused,'invalid_derived_ids',()))
+                fused = selected
+                window_trace['groups'] = base_groups + unit_groups
+                unit_trace['enabled'] = True
+                actual_hits['catalog'] = unit_trace['index_hits']
             policy = self.store.policy_snapshot(plan.user_id,fused,historical=view.intent in {"history","as_of"})
             if not settings.enable_governance or fused.lifecycle_epoch == policy.epoch:
                 break
         else:
             raise LifecycleSnapshotBusy("lifecycle changed during evidence selection")
+        if architecture_active:
+            index_hits=sum(actual_hits.values())
+            route_budget['actual_total']=index_hits
+            if index_hits>settings.candidate_limit:
+                raise NotReady('index_hit_budget_exceeded')
         gated, gate_log = filter_evidence(plan.user_id, fused, policy)
         from app.governance import knowledge_time_gate
         gated, knowledge_time_trace = knowledge_time_gate(plan.query_text, gated, view)
@@ -448,14 +513,6 @@ class RetrievalService:
                     kwargs["authorize"]=authorize
             gated,rerank_trace=self.reranker.rerank(plan.query_text,gated,**kwargs)
         invalid_derived_ids = list(getattr(fused,"invalid_derived_ids",()))
-        from app.rendering import render_span_source, render_source_date, should_show_source_dates
-        renderer=render_span_source if settings.source_labels else None
-        dates_active = settings.temporal_source_dates and should_show_source_dates(plan.query_text)
-        if dates_active:
-            renderer = render_source_date
-        if settings.metadata_roles or settings.metadata_dates:
-            from app.rendering import render_metadata
-            renderer=lambda candidate:render_metadata(candidate,roles=settings.metadata_roles,dates=settings.metadata_dates)
         atom_display_trace={'enabled':False}
         display_groups=()
         if settings.atom_display:
@@ -467,7 +524,16 @@ class RetrievalService:
             from app.atomic_memory import render_atoms_with_raw
             rendered_atoms=render_atoms_with_raw(gated,display_groups,raw_renderer=renderer)
             renderer=lambda candidate:rendered_atoms[candidate.id]
-        if settings.set_selection:
+        if units_active:
+            from app.evidence_budget import pack_units
+            if architecture_active:
+                from app.evidence_architecture import cover_order
+                gated = cover_order(gated,plan.query_text)
+            kept, chars, packing = pack_units(gated, window_trace['groups'],
+                min(request.top_k, settings.max_return_items), settings.return_char_budget,
+                token_budget, renderer, query=plan.query_text,
+                spread_sources=False if architecture_active else None)
+        elif settings.set_selection:
             from app.set_selection import select_evidence
             kept,chars,packing=select_evidence(gated,plan.query_text,min(request.top_k,settings.max_return_items),
                 settings.return_char_budget,settings.return_token_budget,renderer,window_trace['groups'])
@@ -479,6 +545,7 @@ class RetrievalService:
             kept, chars,packing = pack_evidence(gated,min(request.top_k,settings.max_return_items),settings.return_char_budget,
                                               settings.packing_policy,settings.return_token_budget,renderer)
         if self.coordinator is not None:
+            diagnostic.stage('evidence_final_check')
             self.coordinator.final_check(plan.user_id, stamp, kept, policy)
         if display_groups:
             # Complete group packing guarantees identical rendering for kept Raw.
@@ -490,6 +557,8 @@ class RetrievalService:
             if any(final_rendered[h.id]!=renderer(h) for h in kept):
                 raise NotReady('incomplete_atom_display_group')
         trace = {
+            "retrieval_policy": settings.retrieval_policy,
+            "evidence_units": unit_trace, "answer_input_budget": input_budget_trace,
             "adaptive_route":adaptive_trace,
             "sentence_navigation":sentence_trace,"parent_navigation":navigation_trace,
             "bridge_navigation":bridge_trace,

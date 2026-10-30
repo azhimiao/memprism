@@ -1185,12 +1185,50 @@ def require_v4_candidate(tmp_path):
             assert performance['parent_036_v3_sha256']==hashlib.sha256(concurrency_v3_path.read_bytes()).hexdigest()
             if actual_files==set(performance['new']) and all(hashlib.sha256((actual/name).read_bytes()).hexdigest()==value for name,value in performance['new'].items()):
                 candidate_path=performance_path
+        diagnostic_paths=sorted((root/'experiments/057-service-diagnostics').glob('candidate-*.json'))
+        for diagnostic_path in diagnostic_paths:
+            diagnostic=json.loads(diagnostic_path.read_text(encoding='utf-8'))
+            assert diagnostic['parent_037_sha256']==hashlib.sha256(performance_path.read_bytes()).hexdigest()
+            if actual_files==set(diagnostic['new']) and all(hashlib.sha256((actual/name).read_bytes()).hexdigest()==value for name,value in diagnostic['new'].items()):
+                candidate_path=diagnostic_path
+        query_paths=sorted((root/'experiments/058-long-query-repair').glob('candidate-*.json'))
+        for query_path in query_paths:
+            query_candidate=json.loads(query_path.read_text(encoding='utf-8'))
+            parent_path=root/'experiments/057-service-diagnostics/candidate-05.json'
+            assert query_candidate['parent_057_05_sha256']==hashlib.sha256(parent_path.read_bytes()).hexdigest()
+            if actual_files==set(query_candidate['new']) and all(hashlib.sha256((actual/name).read_bytes()).hexdigest()==value for name,value in query_candidate['new'].items()):
+                candidate_path=query_path
+        deterministic_paths=sorted((root/'experiments/061-deterministic-retrieval').glob('candidate-*.json'))
+        for deterministic_path in deterministic_paths:
+            deterministic=json.loads(deterministic_path.read_text(encoding='utf-8'))
+            parent_path=root/'experiments/058-long-query-repair/candidate-03.json'
+            assert deterministic['parent_058_03_sha256']==hashlib.sha256(parent_path.read_bytes()).hexdigest()
+            if actual_files==set(deterministic['new']) and all(hashlib.sha256((actual/name).read_bytes()).hexdigest()==value for name,value in deterministic['new'].items()):
+                candidate_path=deterministic_path
+        architecture_paths=sorted((root/'experiments/062-evidence-architecture').glob('candidate-*.json'))
+        for architecture_path in architecture_paths:
+            architecture=json.loads(architecture_path.read_text(encoding='utf-8'))
+            parent_path=root/'experiments/061-deterministic-retrieval/candidate-01.json'
+            assert architecture['parent_061_01_sha256']==hashlib.sha256(parent_path.read_bytes()).hexdigest()
+            if actual_files==set(architecture['new']) and all(hashlib.sha256((actual/name).read_bytes()).hexdigest()==value for name,value in architecture['new'].items()):
+                candidate_path=architecture_path
         if actual == (root / 'our-system/app').resolve() and candidate_path.is_file():
             candidate = json.loads(candidate_path.read_text(encoding='utf-8'))
             assert candidate['baseline_origin_sha256'] == hashlib.sha256((expected.parent/'origin.json').read_bytes()).hexdigest()
-            if candidate_path in {concurrency_path, concurrency_v2_path, concurrency_v3_path, performance_path}:
+            if candidate_path in {concurrency_path, concurrency_v2_path, concurrency_v3_path, performance_path, *diagnostic_paths}:
                 assert candidate['effects_default'] is True and candidate['default_retrieval_changed'] is False
                 assert candidate['default_lock_wait_seconds'] == Settings(db_path=tmp_path/'lock-default.sqlite').coordinator_lock_timeout_seconds == 30
+            elif candidate_path in query_paths:
+                assert candidate['effects_default'] is True and candidate['default_retrieval_changed'] is True
+                assert candidate['logging_only'] is False and candidate['query_input_policy']=='utf8_windows_weighted_mean_v1'
+            elif candidate_path in deterministic_paths:
+                assert candidate['effects_default'] is False and candidate['default_retrieval_changed'] is False
+                assert candidate['opt_in_retrieval_policy']=='evidence_units_v1'
+                assert Settings(db_path=tmp_path/'061-default.sqlite').retrieval_policy=='legacy'
+            elif candidate_path in architecture_paths:
+                assert candidate['effects_default'] is False and candidate['default_retrieval_changed'] is False
+                assert candidate['opt_in_retrieval_policy']=='evidence_architecture_v1'
+                assert Settings(db_path=tmp_path/'062-default.sqlite').retrieval_policy=='legacy'
             else:
                 assert candidate['effects_default'] is False
             assert candidate['engineering_only'] is True

@@ -17,6 +17,7 @@ from typing import Protocol, Sequence
 from urllib.parse import urlsplit
 
 import httpx
+from app import diagnostics as diagnostic
 
 
 _DASHSCOPE_PATH = "/api/v1/services/embeddings/text-embedding/text-embedding"
@@ -137,7 +138,8 @@ def normalize_vector(vector: object, dimensions: int) -> list[float]:
         raise EmbeddingFailure("invalid_vector")
     try:
         values = [float(v) for v in vector]
-    except (OverflowError, ValueError):
+    except (OverflowError, ValueError) as exc:
+        diagnostic.emit('embedding_transport_failed', exc=exc, reason='invalid_vector')
         raise EmbeddingFailure("invalid_vector") from None
     if any(not math.isfinite(v) for v in values):
         raise EmbeddingFailure("invalid_vector")
@@ -169,6 +171,7 @@ class HttpEmbeddingProvider:
             return self  # OpenAI-compatible embeddings have no separate query role.
         return QueryEmbeddingProvider(self)
 
+    @diagnostic.observe('embedding')
     def embed_guarded(self, texts: Sequence[str], *, before_dispatch=None,
                       text_type: str = "document") -> EmbeddingBatch:
         native = self.config.provider == "dashscope"
@@ -178,10 +181,13 @@ class HttpEmbeddingProvider:
                 or not texts or any(not isinstance(text, str) or not text.strip() for text in texts)):
             raise EmbeddingFailure("invalid_input")
         texts = tuple(texts)  # Validate every batch before the first billable dispatch.
+        diagnostic.emit('input_shape', text_type=text_type, text_count=len(texts),
+                        max_text_bytes=max(len(text.encode('utf-8', errors='replace')) for text in texts))
         if native:
             try:
                 lengths = [len(text.encode("utf-8")) for text in texts]
-            except UnicodeEncodeError:
+            except UnicodeEncodeError as exc:
+                diagnostic.emit('embedding_transport_failed', exc=exc, reason='invalid_input_unicode')
                 raise EmbeddingFailure("invalid_input_unicode") from None
             if any(length > self.config.max_input_bytes for length in lengths):
                 raise EmbeddingFailure("input_too_long")
@@ -259,21 +265,26 @@ class HttpEmbeddingProvider:
                             self._next_dispatch = now + self.config.min_request_interval_seconds
                     if before_dispatch is not None:
                         before_dispatch()
+                    diagnostic.stage('embedding')
                     calls += 1
                     chars += sum(len(text) for text in batch)
                     try:
                         response = client.post(self.config.endpoint,
                             headers={"Authorization": f"Bearer {key}"},
                             json=payload)
-                    except httpx.TimeoutException:
+                    except httpx.TimeoutException as exc:
+                        diagnostic.emit('embedding_transport_failed', exc=exc, reason='embedding_timeout', attempt=attempt+1)
                         code, retryable = "embedding_timeout", True
-                    except httpx.HTTPError:
+                    except httpx.HTTPError as exc:
+                        diagnostic.emit('embedding_transport_failed', exc=exc, reason='embedding_transport_error', attempt=attempt+1)
                         code, retryable = "embedding_transport_error", False
                     else:
+                        diagnostic.emit('embedding_http', status=response.status_code, attempt=attempt+1)
                         if response.status_code == 200:
                             try:
                                 data = response.json()
-                            except ValueError:
+                            except ValueError as exc:
+                                diagnostic.emit('embedding_transport_failed', exc=exc, reason='invalid_embedding_response')
                                 raise EmbeddingFailure("invalid_embedding_response", usage(False)) from None
                             record_usage(data)
                             error = provider_error(data) if native else None
@@ -317,8 +328,10 @@ class HttpEmbeddingProvider:
                         indexed[index] = normalize_vector(item.get("embedding"), self.config.dimensions)
                     vectors.extend(indexed[i] for i in range(len(batch)))
                 except EmbeddingFailure as exc:
+                    diagnostic.emit('embedding_transport_failed', exc=exc, reason=exc.code)
                     raise EmbeddingFailure(exc.code, usage(False)) from None
-                except (ValueError, TypeError, KeyError, AttributeError):
+                except (ValueError, TypeError, KeyError, AttributeError) as exc:
+                    diagnostic.emit('embedding_transport_failed', exc=exc, reason='invalid_embedding_response')
                     raise EmbeddingFailure("invalid_embedding_response", usage(False)) from None
         return EmbeddingBatch(vectors, usage(complete_usage))
 
@@ -336,6 +349,69 @@ class QueryEmbeddingProvider:
 
     def embed_guarded(self, texts: Sequence[str], *, before_dispatch=None) -> EmbeddingBatch:
         return self._provider.embed_guarded(texts, before_dispatch=before_dispatch, text_type="query")
+
+
+def embed_retrieval_query(provider: EmbeddingProvider, text: str, *, before_dispatch=None) -> EmbeddingBatch:
+    """Embed a full query within native per-text byte limits, without changing documents.
+
+    Long native queries use contiguous UTF-8 windows and a normalized, byte-weighted
+    mean. This is an explicit query approximation, not a whole-text model embedding.
+    The caller retains the original query for lexical retrieval and evidence selection.
+    Existing provider views keep dispatch authorization, accounting and batch limits.
+    At most ten nonblank windows are permitted, checked before the first dispatch.
+    Multiple HTTP batches may still fail under the provider's existing rate gate.
+    """
+    def dispatch(texts):
+        guarded = getattr(provider, 'embed_guarded', None)
+        if callable(guarded):
+            return guarded(texts, before_dispatch=before_dispatch)
+        if before_dispatch is not None:
+            before_dispatch()
+        return provider.embed(texts)
+
+    if provider.config.provider != 'dashscope':
+        return dispatch([text])
+    try:
+        encoded = text.encode('utf-8')
+    except UnicodeEncodeError:
+        raise EmbeddingFailure('invalid_input_unicode') from None
+    limit = provider.config.max_input_bytes
+    if len(encoded) <= limit:
+        return dispatch([text])
+    chunks = []
+    start = 0
+    while start < len(encoded):
+        end = min(start + limit, len(encoded))
+        # Never cut a multibyte codepoint. Validate the entire string before I/O.
+        while end < len(encoded) and encoded[end] & 0xC0 == 0x80:
+            end -= 1
+        if end == start:
+            raise EmbeddingFailure('input_too_long')
+        chunk = encoded[start:end].decode('utf-8')
+        if chunk.strip():
+            chunks.append(chunk)
+            if len(chunks) > 10:
+                raise EmbeddingFailure('input_too_long', {'requests': 0,
+                    'query_input_policy': 'utf8_windows_weighted_mean_v1',
+                    'query_window_limit': 10, 'query_window_budget_exceeded': True})
+        start = end
+    if not chunks:
+        raise EmbeddingFailure('invalid_input')
+    batch = dispatch(chunks)
+    if len(batch.vectors) != len(chunks):
+        raise EmbeddingFailure('response_count_mismatch', batch.usage)
+    vectors = [normalize_vector(vector, provider.config.dimensions) for vector in batch.vectors]
+    weights = [len(chunk.strip().encode('utf-8')) for chunk in chunks]
+    total = sum(weights)
+    mean = [math.fsum(vector[i] * (weight / total) for vector, weight in zip(vectors, weights))
+            for i in range(provider.config.dimensions)]
+    # Exact opposing vectors have no mean direction. Prefer the longest window,
+    # with an input-order tie break, rather than emitting an invalid zero vector.
+    cancelled = max(abs(value) for value in mean) <= 1e-12
+    vector = vectors[max(range(len(weights)), key=weights.__getitem__)] if cancelled else normalize_vector(mean, provider.config.dimensions)
+    usage = dict(batch.usage, query_input_policy='utf8_windows_weighted_mean_v1',
+                 query_window_count=len(chunks), query_mean_cancelled=cancelled)
+    return EmbeddingBatch([vector], usage)
 
 
 class DashScopeEmbeddingProvider(HttpEmbeddingProvider):

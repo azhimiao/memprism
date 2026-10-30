@@ -199,6 +199,8 @@ class SqliteStore:
                 segments.initialize(connection)
                 from app import evidence_navigation
                 evidence_navigation.initialize(connection)
+                from app import evidence_catalog
+                evidence_catalog.initialize(connection)
                 from app.atomic_memory import initialize as initialize_atoms
                 initialize_atoms(connection)
                 connection.execute("COMMIT")
@@ -382,6 +384,9 @@ class SqliteStore:
                     if atom_embedding is not None:
                         insert_atom_vectors(connection,prepared_atoms,atom_embedding,user_id=user_id)
                 prune_atoms(connection,user_id)
+                if profile is not None and 'catalog' in profile.required_routes:
+                    from app.evidence_catalog import sync
+                    sync(connection, user_id)
                 write_publication_on(connection, user_id, request_id, profile)
                 if coordinator is not None:
                     if not pure_control:
@@ -715,6 +720,33 @@ class SqliteStore:
                     connection.execute("ROLLBACK")
                 connection.close()
 
+    def assemble_catalog_evidence(self, user_id, candidates, query, **budgets):
+        from app.evidence_architecture import assemble
+        from app.evidence_catalog import ready
+        with self._lock:
+            db = self._connect()
+            try:
+                db.execute("BEGIN")
+                if not ready(db, user_id):
+                    raise NotReady('incomplete_catalog_route')
+                return assemble(db,user_id,candidates,query,**budgets)
+            finally:
+                if db.in_transaction:
+                    db.execute("ROLLBACK")
+                db.close()
+
+    def expand_evidence_units(self, user_id, candidates, limit=200, **budgets):
+        from app.evidence_units import expand_units
+        with self._lock:
+            db = self._connect()
+            try:
+                db.execute("BEGIN")
+                return expand_units(db, user_id, candidates, limit=limit, **budgets)
+            finally:
+                if db.in_transaction:
+                    db.rollback()
+                db.close()
+
     def expand_span_windows(self,user_id,candidates,limit=200):
         from app.support_groups import span_windows
         with self._lock:
@@ -868,6 +900,9 @@ class SqliteStore:
                                          and (source["retraction_state"] != "retracted" or candidate.representation == "attributed_raw_v1"))
                         if candidate.representation == "span_exact_v1":
                             content_valid = segments.valid_candidate(db,candidate,source) and source["retraction_state"] != "retracted"
+                        elif candidate.representation == "evidence_block_v1":
+                            from app.evidence_catalog import valid_candidate
+                            content_valid = valid_candidate(db,candidate,source)
                         policies[candidate.source_raw_id] = SourcePolicy(
                             user_id=user_id,raw_id=candidate.source_raw_id,
                             version=int(source["source_version"]),

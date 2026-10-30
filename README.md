@@ -1,145 +1,139 @@
 # MemPrism
 
-MemPrism is a candidate memory service for the Agent Memory Leaderboard (AML) Cycle 2, open-source
-method category. It implements the leaderboard's HTTP contract:
+MemPrism implements the Agent Memory Leaderboard (AML) Add/Search contract with
+source-backed retrieval. This release publishes **evidence-architecture-062-03**.
+It retains SQLite FTS5, DashScope `text-embedding-v4` (1024 dimensions), and
+Reciprocal Rank Fusion. Its deployed configuration uses **no generative LLM
+extraction, summarization, answer generation, or reranker**. Embedding API calls
+still incur provider charges; this deployment is hybrid retrieval.
 
-| Endpoint | Behaviour |
+## API
+
+| Endpoint | Behavior |
 |---|---|
-| `POST /add` | Synchronously persists one batch of `user`/`assistant` messages for a `user_id`. When it returns 200 the messages are stored and searchable. Idempotent per `request_id`: the same body replays the first result, a different body returns 409. Other roles are rejected with 422. |
-| `POST /search` | Returns `{"data": [...]}`: at most `top_k` evidence items from that `user_id` only, ordered by relevance. `content` is text copied verbatim from stored messages; nothing is generated. |
-| `GET /health` | Readiness plus the retrieval `config_hash`; no authentication. |
+| `POST /add` | Synchronously stores user/assistant messages and required indexes for a user. A successful response acknowledges searchable data. Identical request replay is idempotent; conflicting reuse returns 409. |
+| `POST /search` | Returns `{"data": [...]}` with at most `top_k` evidence records, capped at 100, restricted to the requested user. Evidence is grounded in saved source spans; deterministic date labels may accompany source text. It does not generate an answer. |
+| `GET /health` | Reports control/data readiness and retrieval configuration hash. |
 
-`/add` and `/search` require `Authorization: Bearer <service key>`.
+Add/Search use `Authorization: Bearer <service key>`. That key is distinct from
+the leaderboard evaluation key and the embedding provider key. Never commit any
+of these keys or benchmark conversations.
 
-## Method
+## Retrieval architecture
 
-- Messages are split into exact spans of the original text and stored in SQLite (WAL) with an FTS5
-  index and 1024-dimensional dense vectors from Alibaba Cloud Model Studio `text-embedding-v4`.
-  Every query is scoped to the requesting `user_id`.
-- Search takes up to 100 lexical (FTS5) and 100 dense candidates and fuses them with Reciprocal Rank
-  Fusion (k = 60), returning up to 100 items within the configured return budget.
-- Add and Search call no LLM and no reranker; the only model is the embedding model.
-- A lifecycle coordinator fences concurrent Adds: a Search that overlaps a commit for the same user
-  retries against a stable snapshot and returns 503 if the snapshot keeps changing, so a result never
-  mixes two commits.
+- Raw messages, source offsets/hashes, FTS postings, and dense vectors share a
+  SQLite/WAL store. Add acknowledgement follows the required publication work.
+- Lexical and exact dense candidates are fused with RRF (`k=60`). Per-user
+  transaction coordination and snapshot checks protect concurrent Add/Search.
+- Long query embedding uses bounded UTF-8 windows and an aggregate vector;
+  requests beyond the total query budget are rejected instead of retried forever.
+- The 062 policy adds a deterministic source-block catalog, user-scoped catalog
+  FTS, history navigation, and groups that preserve rule references or table
+  headers with supporting rows. All retrieval routes share a 200-candidate budget.
+- Explicit state/conflict and disclosure markers guide evidence selection.
+  These bounded rules do not constitute general semantic conflict resolution or
+  a guarantee that every sensitive fact will be identified.
+- Source provenance is checked before return. Source bodies are not instructions
+  to the service. Retrieval does not inspect hidden labels or store query-generated
+  facts. Engineering tests use synthetic inputs, not official evaluation answers.
 
-The existing 027 deployment template is `our-system/deploy/server/env.server.example`
-(`AML_PROFILE=cycle2_dense`, `AML_RETRIEVAL_MODE=raw_hybrid_rrf`); `/health` reports its
-`config_hash` (`08e945a951ade441…`). Experimental mechanisms in the code base (sentence index,
-neighbour/parent expansion, typed or option routing, temporal projection, reranking, atomic memories,
-governance) are off in this configuration.
+The 062 policy is opt-in (`evidence_architecture_v1`). Legacy optional LLM and
+reranking modules remain available as research code but are disabled in the
+configuration below. Candidate manifests are immutable build-time records;
+their historical `official_smoke_passed: false` is not a live evaluation status.
 
-## Run
+## Reproduce this configuration
 
-### Docker (the deployed path)
-
-The server deployment (Ubuntu, Docker Compose, nginx, Let's Encrypt) is described in
-[`our-system/deploy/server/README.md`](our-system/deploy/server/README.md) (Chinese). In short:
-
-```bash
-cp our-system/deploy/server/env.server.example /etc/aml/aml.env   # fill AML_SERVICE_API_KEY, DASHSCOPE_API_KEY
-AML_ENV_FILE=/etc/aml/aml.env bash our-system/deploy/server/deploy.sh
-curl -fsS http://127.0.0.1:28717/health
-```
-
-### Python
-
-Python 3.12.11 with the pinned dependencies:
+Use Python 3.12.11 and the pinned dependencies. For a fresh database:
 
 ```bash
 cd our-system
-python -m venv .venv && . .venv/bin/activate
+python -m venv .venv
+. .venv/bin/activate
 pip install --no-deps -r requirements-cycle2.txt
-set -a; . deploy/server/env.server.example; set +a
-export AML_DB_PATH="$PWD/data/aml.sqlite" AML_HOST=127.0.0.1 \
-       AML_SERVICE_API_KEY='<choose-a-key>' DASHSCOPE_API_KEY='<your-DashScope-key>'
+set -a
+. deploy/server/env.062.example
+set +a
+export AML_DB_PATH="$PWD/data/aml.sqlite" AML_HOST=127.0.0.1
+export AML_SERVICE_API_KEY='<choose-a-key>' DASHSCOPE_API_KEY='<your-DashScope-key>'
 python -m deploy.start
 ```
 
-## Tests
+For a fresh Docker deployment, follow
+[the server guide](our-system/deploy/server/README.md), using
+[`env.062.example`](our-system/deploy/server/env.062.example) as the environment
+template. The older `env.server.example` is retained for historical configurations.
+Do not apply these fresh-install commands over a live evaluation database. Existing
+databases require backed-up, identity-checked index migration and certification;
+changing an environment variable alone is not an upgrade procedure.
+
+The 062 profile hash is
+`c1f5d8441ef03bd3ef2bf5075af4cce125c23bdac7b4b2bf3cfc8acca385009a`.
+Its 35 application files are identified by
+[`candidate-03.json`](experiments/062-evidence-architecture/candidate-03.json).
+The operator verified these files on the deployed service on 2026-10-30.
+A health hash alone does not establish source identity. Publication does not
+change the server or update a platform submission automatically.
+
+## Verification and operational limits
 
 ```bash
 cd our-system
-python -m pytest -q -p no:cacheprovider
+python -m pytest tests -q -p no:cacheprovider
 ```
 
-The application tests run offline, with engineering embedding doubles. The 037 application was
-verified locally with 1022 passed and 35 existing skipped tests; the public export is checked again
-before publication. This is engineering validation, not an AML score or a Full capacity guarantee.
-The skipped tests require opt-in historical build-v3/build-v5 snapshots absent from this repository.
+The 062 workspace application suite passed 1190 tests, with 35 pre-existing skips
+for absent opt-in historical snapshots. These are offline engineering checks;
+they do not prove Full capacity or official answer quality. Necessary historical
+source manifests and minimal baseline code are included for reproducibility.
 
-`tests/test_optional_adversarial.py` checks the source identity chain. Public manifests include the
-030/031/036 ancestors and `experiments/037-retrieval-performance/candidate-final.json`; the current
-29 application files must match that manifest. Historical manifests retain their original identity.
-The frozen 037 `baseline/app/segments.py` is included for the performance equivalence regression.
+The operator reported a successful platform Smoke on 2026-10-30. No Full result
+is claimed here. See [current submission notes](SUBMISSION-evidence-062.md) for
+deployed limits and unresolved capacity verification. Existing 027 notes remain
+historical and must not be used as the current deployment description.
 
-## Data handling
+Keep the same acknowledged database, indexes, receipts, and compatible code during
+an interrupted evaluation. Logs help diagnose failure but cannot create an official
+checkpoint. Recovery uses the original platform task when the platform permits it.
+Provider processing before a local persistence failure can cause duplicate billing;
+request idempotency does not guarantee exactly-once provider charges.
 
-Benchmark data is not included in this repository. The service stores only what the platform sends
-to `/add`, in a single SQLite database (`/var/lib/aml/aml-hybrid.sqlite` in the server deployment).
-Operators must delete evaluation data within 30 days after the task by removing that database
-(with its `-wal`/`-shm` files) and its backups under `/var/backups/aml/`. This is an operational
-retention requirement; automatic cleanup is not implemented. Preserve acknowledged memory
-and indexes throughout an interrupted evaluation and its recovery.
-
-## Release and deployment status
-
-This repository now includes the locally verified 037 concurrency/performance candidate,
-`cycle2-exact-retrieval-performance-v2`. Its manifest SHA256 is
-`bf78e687f3485f2403365034c57849226b6a32257c204ec9615e9f0d8cb2f66e`.
-Publishing this code does not deploy it. The existing public service was originally released
-from commit `c37de8791805227fa43181bdf0013e2e6f7a33c7` (027); its current source identity
-must be verified by the operator before claiming an exact deployed commit. A health/config
-hash alone does not prove application source identity.
-
-For an access request concerning that old deployment, use the fixed old commit and the
-[027 submission notes](SUBMISSION-hybrid-027.md), after verifying the server matches it.
-Do not identify the new main branch as deployed until the operator has deployed and verified it.
-
-The 037 changes serialize per-user preparation and reduce repeated readiness-count and exact
-dense-scoring work. Six final local mixed-load rounds completed 384/384 request positions;
-measured mixed-load Search p95 remained about 27-29 seconds for FTS and 98-103 seconds for
-Hybrid. These were local handlers with cached real vectors, not public HTTP or live supplier
-capacity tests. Production model dispatch can still be billed twice if a supplier processes a
-request before local persistence fails; request-id idempotency is not exactly-once billing.
-
-The research configuration `cycle2_raw` / `raw_fts` uses no embedding or LLM API. A small local
-unseen-source comparison favored keeping FTS as a cost-first candidate and Hybrid optional;
-this does not establish FTS as universally better. The supplied `deploy.start`/`deploy.runtime`
-launcher still requires a formal dense configuration and cannot launch FTS merely by changing
-the two profile/mode variables. A compatible production entry point must be provided and
-verified before deploying FTS. LLM extraction remains optional and disabled by default.
-
-No official Smoke/Full result is established by this release. The operator handles deployment,
-capacity verification, and official evaluation separately. Existing confirmed raw data, indexes,
-request receipts and accounting state must be backed up and retained during upgrades.
+Benchmark data is not distributed. Operators are responsible for the official
+retention deadline (currently within 30 days after the task), covering the live
+database, WAL/SHM, backups, and any other data copies. Automatic cleanup is not
+implemented. Preserve acknowledged data throughout permitted recovery.
 
 ## Attribution
 
-- Reciprocal Rank Fusion: G. V. Cormack, C. L. A. Clarke and S. Büttcher, "Reciprocal Rank Fusion
-  outperforms Condorcet and individual Rank Learning Methods", SIGIR 2009.
-- Lexical retrieval: SQLite FTS5.
-- Embeddings: Alibaba Cloud Model Studio (DashScope) `text-embedding-v4`.
-- Token counting: OpenAI `tiktoken` (`o200k_base`).
-- Runtime libraries: FastAPI, Starlette, Uvicorn, Pydantic, HTTPX, NumPy (versions in
-  `our-system/requirements-cycle2.txt`).
+This is a system implementation informed by the following prior work. These
+references are not claims of having invented FTS, RRF, embeddings, or memory
+governance. The repository contains our implementations and attributed runtime
+dependencies, not vendored copies of these memory-system repositories.
 
-- HTTP contract and evaluation: the AML [API guide](https://agentmemories.ai/api-guide) and
-  [official harness](https://github.com/AML-memory/agent-memory-leaderboard).
-
-The public memory systems below were studied at the listed revisions. Their mechanisms were
-reimplemented; no third-party source code is included.
-
-| Project | Revision studied | Mechanisms that informed MemPrism |
+| Prior work | Studied revision | Design influence |
 |---|---|---|
-| [InvMem](https://github.com/wenxiaof345-ctrl/vanilla-rag-memory) | `31ab7bf9` | Per-user lexical + dense retrieval fused with RRF (027 template; retained in code). Query/option views, context windows (experimental, off). |
-| [ActiveMemoryIndex](https://github.com/linxuhao/ActiveMemoryIndex) | `9bb0497c` | Store raw messages first; per-user idempotent Add (027 template; retained in code). Derived facts, single rewrite (experimental, off). |
-| [Mem0](https://github.com/mem0ai/mem0) | `94c3fe9f` | Explicit user scoping (027 template; retained in code). Change history, thresholds (experimental, off). |
-| [MemMachine](https://github.com/MemMachine/MemMachine) | `d57f5cb3` | Index representation kept separate from returned source text (027 template; retained in code). Context expansion (experimental, off). |
-| [memfusion](https://github.com/huangpengtao00-dotcom/memfusion-memory) | `8578b646` | Fusion rank kept separate from relevance score (027 template; retained in code). Query expansion (experimental, off). |
-| [ChronoHybridMem](https://github.com/Tin11Mn/chrono-hybrid-mem) | `a8411527` | Query plans, support witnesses, temporal views (experimental, off). |
-| [M-flow](https://github.com/FlowElement-xinliuyuansu/m_flow) | `0d585cda` | Typed routing, episode/facet structure, procedures (experimental, off). |
-| [agent-memory-leaderboard-2026](https://github.com/cenjoy/agent-memory-leaderboard-2026) | `553f9c96` | Type-aware replacement vs. coexistence, privacy gate position (experimental, off). |
+| [InvMem](https://github.com/wenxiaof345-ctrl/vanilla-rag-memory) | `31ab7bf9` | Per-user lexical/dense fusion, retrieval views and context support. |
+| [ActiveMemoryIndex](https://github.com/linxuhao/ActiveMemoryIndex) | `9bb0497c` | Preserve raw input, idempotent ingestion and separate derived views. |
+| [Mem0](https://github.com/mem0ai/mem0) | `94c3fe9f` | User-scoped storage and explicit update/history concepts. |
+| [MemMachine](https://github.com/MemMachine/MemMachine) | `d57f5cb3` | Separate searchable representation from returned source evidence. |
+| [memfusion](https://github.com/huangpengtao00-dotcom/memfusion-memory) | `8578b646` | Separate fusion rank from relevance score. |
+| [ChronoHybridMem](https://github.com/Tin11Mn/chrono-hybrid-mem) | `a8411527` | Query plans, supporting witnesses, temporal evidence. |
+| [M-flow](https://github.com/FlowElement-xinliuyuansu/m_flow) | `0d585cda` | Typed/episode organization and procedural evidence. |
+| [agent-memory-leaderboard-2026](https://github.com/cenjoy/agent-memory-leaderboard-2026) | `553f9c96` | Replacement versus coexistence and privacy filtering boundaries. |
+
+Our 061/062 changes implement bounded deterministic evidence assembly, source
+catalogs, dependency-preserving groups, and source-certified snapshots. These are
+implementation differences, not demonstrated superiority over the referenced systems.
+
+- RRF: G. V. Cormack, C. L. A. Clarke and S. Büttcher, *Reciprocal Rank Fusion
+  outperforms Condorcet and individual Rank Learning Methods*, SIGIR 2009,
+  [DOI:10.1145/1571941.1572114](https://doi.org/10.1145/1571941.1572114).
+- [SQLite FTS5](https://sqlite.org/fts5.html), Alibaba Cloud Model Studio/DashScope
+  `text-embedding-v4`, and OpenAI `tiktoken` (`o200k_base`).
+- FastAPI, Starlette, Uvicorn, Pydantic, HTTPX, NumPy and other pinned libraries
+  are listed in `our-system/requirements-cycle2.txt`.
+- Evaluation contract: [AML API Guide](https://agentmemories.ai/api-guide) and
+  [official harness](https://github.com/AML-memory/agent-memory-leaderboard).
 
 ## License
 
