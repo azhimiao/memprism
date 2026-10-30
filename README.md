@@ -51,13 +51,20 @@ cd our-system
 python -m venv .venv
 . .venv/bin/activate
 pip install --no-deps -r requirements-cycle2.txt
+export TIKTOKEN_CACHE_DIR="$PWD/.token-cache"
+python -c "import tiktoken; tiktoken.get_encoding('o200k_base')"
 set -a
 . deploy/server/env.062.example
 set +a
 export AML_DB_PATH="$PWD/data/aml.sqlite" AML_HOST=127.0.0.1
 export AML_SERVICE_API_KEY='<choose-a-key>' DASHSCOPE_API_KEY='<your-DashScope-key>'
+python -m deploy.runtime --configuration
 python -m deploy.start
 ```
+
+The tokenizer initialization downloads a public encoding asset, not model
+inference. The runtime check validates its hash and configuration offline before
+startup; substitute real keys privately for the placeholders above.
 
 For a fresh Docker deployment, follow
 [the server guide](our-system/deploy/server/README.md), using
