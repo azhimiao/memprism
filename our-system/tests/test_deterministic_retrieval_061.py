@@ -170,9 +170,11 @@ def test_real_native_adapter_mock_long_query_and_permanent_vs_transient_error(mo
         assert len(wire) == 1 and len(wire[0]['input']['texts']) == 2
         wire.clear()
         result = search(client, 'context ' * 11000)
-        assert result.status_code == 422
-        assert result.json() == {'detail': 'query_window_budget_exceeded'}
-        assert wire == [] and 'Retry-After' not in result.headers
+        assert result.status_code == 200
+        assert len(wire) == 2
+        assert all(len(body['input']['texts']) <= 10 for body in wire)
+        assert ''.join(text for body in wire for text in body['input']['texts']) == ('context ' * 11000).strip()
+        assert 'Retry-After' not in result.headers
         failure.append(True)
         result = search(client, 'cobalt')
         assert result.status_code == 503 and result.headers['Retry-After'] == '1'

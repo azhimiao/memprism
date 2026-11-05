@@ -1104,7 +1104,20 @@ def require_v4_candidate(tmp_path):
     actual_files = {path.name for path in actual.glob("*.py")}
     mismatches = [name for name, value in hashes.items()
                   if name not in actual_files or hashlib.sha256((actual / name).read_bytes()).hexdigest() != value]
-    if actual_files != set(hashes) or mismatches:
+    published = root / 'releases/runtime-103.json'
+    published_identity = False
+    if published.is_file():
+        release = json.loads(published.read_bytes())
+        assert release['runtime_revision'] == 'local-103'
+        assert release['source_manifest_sha256'] == 'e867889108966f0fb09d9e47bf4ddc7f0e8c4908dbb93fc70514d9a4d50e99fa'
+        assert release['file_count'] == len(release['files']) == 50
+        current = {('our-system/app/' + p.name): hashlib.sha256(p.read_bytes()).hexdigest()
+                   for p in actual.glob('*.py')}
+        expected_current = {p: h for p, h in release['files'].items()
+                            if p.startswith('our-system/app/')}
+        assert current == expected_current and len(current) == release['app_files'] == 42
+        published_identity = True
+    if (actual_files != set(hashes) or mismatches) and not published_identity:
         # E38 extends the runtime with explicitly disabled effects. Its own
         # source manifest qualifies running these unchanged default contracts;
         # historical v4 remains bound above and is never relabeled identical.
@@ -1212,6 +1225,59 @@ def require_v4_candidate(tmp_path):
             assert architecture['parent_061_01_sha256']==hashlib.sha256(parent_path.read_bytes()).hexdigest()
             if actual_files==set(architecture['new']) and all(hashlib.sha256((actual/name).read_bytes()).hexdigest()==value for name,value in architecture['new'].items()):
                 candidate_path=architecture_path
+        repair_paths=sorted((root/'experiments/067-add-write-repair').glob('candidate-*.json'))
+        for repair_path in repair_paths:
+            repair=json.loads(repair_path.read_text(encoding='utf-8'))
+            parent_path=root/'experiments/062-evidence-architecture/candidate-03.json'
+            assert repair['parent_062_03_sha256']==hashlib.sha256(parent_path.read_bytes()).hexdigest()
+            parent=json.loads(parent_path.read_text(encoding='utf-8'))
+            assert repair['old']==parent['new']
+            if actual_files==set(repair['new']) and all(hashlib.sha256((actual/name).read_bytes()).hexdigest()==value for name,value in repair['new'].items()):
+                candidate_path=repair_path
+        health_paths=sorted((root/'experiments/071-health-readiness-repair').glob('candidate-*.json'))
+        for health_path in health_paths:
+            health_candidate=json.loads(health_path.read_text(encoding='utf-8'))
+            parent_path=root/'experiments/067-add-write-repair/candidate-01.json'
+            assert health_candidate['parent_067_01_sha256']==hashlib.sha256(parent_path.read_bytes()).hexdigest()
+            health_parent=json.loads(parent_path.read_text(encoding='utf-8'))
+            assert health_candidate['old']==health_parent['new']
+            assert health_candidate['changed_app_files']==['api.py']
+            assert {k for k in health_candidate['new'] if health_candidate['new'][k]!=health_candidate['old'][k]}=={'api.py'}
+            if actual_files==set(health_candidate['new']) and all(hashlib.sha256((actual/name).read_bytes()).hexdigest()==value for name,value in health_candidate['new'].items()):
+                candidate_path=health_path
+        relief_paths=sorted((root/'experiments/073-lease-memory-root-relief').glob('candidate-*.json'))
+        for relief_path in relief_paths:
+            relief=json.loads(relief_path.read_text(encoding='utf-8'))
+            parent_path=root/'experiments/071-health-readiness-repair/candidate-02.json'
+            assert relief['parent_071_02_sha256']==hashlib.sha256(parent_path.read_bytes()).hexdigest()
+            relief_parent=json.loads(parent_path.read_text(encoding='utf-8'))
+            assert relief['old']==relief_parent['new']
+            assert set(relief['new'])==set(relief['old'])|{'writer_gate.py'}
+            assert {k for k in relief['old'] if relief['new'][k]!=relief['old'][k]}=={'jobs.py','segments.py','store.py'}
+            if actual_files==set(relief['new']) and all(hashlib.sha256((actual/name).read_bytes()).hexdigest()==value for name,value in relief['new'].items()):
+                candidate_path=relief_path
+        startup_paths=sorted((root/'experiments/074-startup-query-repair').glob('candidate-*.json'))
+        for startup_path in startup_paths:
+            startup=json.loads(startup_path.read_text(encoding='utf-8'))
+            startup_parent_path=root/'experiments/073-lease-memory-root-relief/candidate-01.json'
+            assert startup['parent_073_01_sha256']==hashlib.sha256(startup_parent_path.read_bytes()).hexdigest()
+            startup_parent=json.loads(startup_parent_path.read_text(encoding='utf-8'))
+            assert startup['old']==startup_parent['new']
+            assert set(startup['new'])==set(startup['old'])
+            assert {k for k in startup['old'] if startup['new'][k]!=startup['old'][k]}=={'segments.py'}
+            if actual_files==set(startup['new']) and all(hashlib.sha256((actual/name).read_bytes()).hexdigest()==value for name,value in startup['new'].items()):
+                candidate_path=startup_path
+        write_ready_paths=sorted((root/'experiments/076-write-readiness-repair').glob('candidate-*.json'))
+        for write_ready_path in write_ready_paths:
+            write_ready=json.loads(write_ready_path.read_text(encoding='utf-8'))
+            write_parent_path=root/'experiments/074-startup-query-repair/candidate-01.json'
+            assert write_ready['parent_074_01_sha256']==hashlib.sha256(write_parent_path.read_bytes()).hexdigest()
+            write_parent=json.loads(write_parent_path.read_text(encoding='utf-8'))
+            assert write_ready['old']==write_parent['new']
+            assert set(write_ready['new'])==set(write_ready['old'])|{'write_runtime.py'}
+            assert {k for k in write_ready['old'] if write_ready['new'][k]!=write_ready['old'][k]}=={'api.py','jobs.py','k0_migrate.py','segments.py','store.py'}
+            if actual_files==set(write_ready['new']) and all(hashlib.sha256((actual/name).read_bytes()).hexdigest()==value for name,value in write_ready['new'].items()):
+                candidate_path=write_ready_path
         if actual == (root / 'our-system/app').resolve() and candidate_path.is_file():
             candidate = json.loads(candidate_path.read_text(encoding='utf-8'))
             assert candidate['baseline_origin_sha256'] == hashlib.sha256((expected.parent/'origin.json').read_bytes()).hexdigest()
@@ -1229,6 +1295,33 @@ def require_v4_candidate(tmp_path):
                 assert candidate['effects_default'] is False and candidate['default_retrieval_changed'] is False
                 assert candidate['opt_in_retrieval_policy']=='evidence_architecture_v1'
                 assert Settings(db_path=tmp_path/'062-default.sqlite').retrieval_policy=='legacy'
+            elif candidate_path in repair_paths:
+                assert candidate['effects_default'] is True and candidate['default_retrieval_changed'] is False
+                assert candidate['document_embedding_identity_changed'] is False and candidate['schema_changed'] is False
+                assert candidate['profile_config_hash']==parent['profile_config_hash']
+                assert Settings(db_path=tmp_path/'067-default.sqlite').retrieval_policy=='legacy'
+            elif candidate_path in health_paths:
+                assert candidate['effects_default'] is True and candidate['default_retrieval_changed'] is False
+                assert candidate['document_embedding_identity_changed'] is False and candidate['schema_changed'] is False
+                assert candidate['profile_config_hash']==health_parent['profile_config_hash']
+                assert candidate['health_policy']=='single_inflight_full_audit_readonly_observer_data_version_v1'
+                assert Settings(db_path=tmp_path/'071-default.sqlite').retrieval_policy=='legacy'
+            elif candidate_path in relief_paths:
+                assert candidate['effects_default'] is True and candidate['default_retrieval_changed'] is False
+                assert candidate['document_embedding_identity_changed'] is False and candidate['schema_changed'] is False
+                assert candidate['profile_config_hash']==relief_parent['profile_config_hash']
+                assert Settings(db_path=tmp_path/'073-default.sqlite').retrieval_policy=='legacy'
+            elif candidate_path in startup_paths:
+                assert candidate['effects_default'] is True and candidate['default_retrieval_changed'] is False
+                assert candidate['document_embedding_identity_changed'] is False and candidate['schema_changed'] is False
+                assert candidate['profile_config_hash']==startup_parent['profile_config_hash']
+                assert Settings(db_path=tmp_path/'074-default.sqlite').retrieval_policy=='legacy'
+            elif candidate_path in write_ready_paths:
+                assert candidate['effects_default'] is True and candidate['default_retrieval_changed'] is False
+                assert candidate['document_embedding_identity_changed'] is False and candidate['schema_changed'] is False
+                assert candidate['profile_config_hash']==write_parent['profile_config_hash']
+                assert candidate['health_policy']=='same_writer_actual_snapshot_invalidation_v1'
+                assert Settings(db_path=tmp_path/'076-default.sqlite').retrieval_policy=='legacy'
             else:
                 assert candidate['effects_default'] is False
             assert candidate['engineering_only'] is True

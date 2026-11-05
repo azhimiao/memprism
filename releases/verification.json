@@ -1,0 +1,49 @@
+{
+  "scope": "public release engineering validation; not a new official evaluation",
+  "application_suite": {
+    "tests": 1357,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 35,
+    "passed": 1322,
+    "junit_sha256": "1e687387a72d7055216198af6f39009404f46e1bf87f28eabde0906eb0abf634"
+  },
+  "gateway_suite": {
+    "tests": 24,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0,
+    "passed": 24,
+    "junit_sha256": "0846acbb1c8ff7b2184eb8c6b5dedf173282423bb7538452dd2376778994a70f"
+  },
+  "release_qualification_focus": {
+    "tests": 49,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0,
+    "passed": 49,
+    "junit_sha256": "61ff0041dfa120f08cd745b0b556f0fad6e9e591ef66b17c76ef7dec053f2aff"
+  },
+  "runtime_files_byte_identical": 50,
+  "application_modules_byte_identical": 42,
+  "fresh_database_bootstrap_verified": true,
+  "serving_health_http": 200,
+  "source_tests_adapted_for_release": [
+    {
+      "file": "our-system/tests/test_optional_adversarial.py",
+      "change": "qualify local-103 using its exact published file manifest; retain behavioral assertions"
+    },
+    {
+      "file": "our-system/tests/test_v4_provider.py",
+      "change": "initialize a new empty database before launching the evaluated serving entry"
+    }
+  ],
+  "post_test_changes": [
+    "README.md",
+    "docs/REPRODUCING.md"
+  ],
+  "external_model_calls": 0,
+  "production_changes": 0,
+  "official_job_mutations": 0,
+  "earlier_failed_export_test_run_preserved_in_private_work_log": true
+}

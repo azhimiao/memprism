@@ -92,12 +92,14 @@ def migrate(source: Path, target: Path, settings: Settings, provider=None):
                     insert(rebuilt,user,missing)
             rebuilt.commit()
     coordinator = JobCoordinator(store, profile)
-    coordinator.activate()
-    with coordinator.transaction(False) as db:
-        users = [r[0] for r in db.execute("SELECT DISTINCT user_id FROM raw_messages ORDER BY user_id")]
-        receipt_hash = hashlib.sha256(json.dumps([tuple(r) for r in db.execute(
-            "SELECT * FROM add_requests ORDER BY user_id,request_id")], ensure_ascii=False).encode()).hexdigest()
-    proofs = [coordinator.certify_routes(user) for user in users]
+    # This offline tool owns the lifetime of its retained coordinator connection.
+    with closing(store._writer):
+        coordinator.activate()
+        with coordinator.transaction(False) as db:
+            users = [r[0] for r in db.execute("SELECT DISTINCT user_id FROM raw_messages ORDER BY user_id")]
+            receipt_hash = hashlib.sha256(json.dumps([tuple(r) for r in db.execute(
+                "SELECT * FROM add_requests ORDER BY user_id,request_id")], ensure_ascii=False).encode()).hexdigest()
+        proofs = [coordinator.certify_routes(user) for user in users]
     with closing(store._connect()) as db:
         check = [r[0] for r in db.execute("PRAGMA integrity_check")]
         checkpoint = tuple(db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone())

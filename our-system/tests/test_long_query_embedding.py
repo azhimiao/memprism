@@ -83,13 +83,14 @@ def test_unicode_preflight_prevents_any_dispatch(monkeypatch):
     assert wire == []
 
 
-def test_total_window_budget_is_checked_before_first_dispatch(monkeypatch):
+def test_query_longer_than_one_batch_covers_every_window(monkeypatch):
     provider, wire = native(monkeypatch, limit=16)
-    with pytest.raises(EmbeddingFailure) as error:
-        embed_retrieval_query(provider.for_query(), 'x' * 161)
-    assert error.value.code == 'input_too_long'
-    assert error.value.usage['query_window_budget_exceeded'] is True
-    assert error.value.usage['requests'] == 0 and wire == []
+    text = 'x' * 161
+    result = embed_retrieval_query(provider.for_query(), text)
+    assert ''.join(inputs(wire)) == text
+    assert len(inputs(wire)) == 11 and len(wire) == 2
+    assert result.usage['requests'] == 2
+    assert result.usage['query_window_count'] == 11
 
 
 def test_existing_rate_gate_can_fail_multibatch_query_without_hiding_first_cost(monkeypatch, tmp_path):

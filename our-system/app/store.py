@@ -25,6 +25,9 @@ from app.governance import GovernancePlan, statement_digest, TemporalView
 from app.memory_core import initialize_core, apply_core, operation_receipts, valid_derived_source
 from app.jobs import initialize_jobs, write_publication_on, embedding_messages_on, NotReady
 from app import segments
+from app.writer_gate import WriterGate
+from app.read_pool import ReadPool
+from app.write_runtime import WriteRuntime
 
 _PARTITION_NAME = re.compile(r"^fts_u_[0-9a-f]{64}$")
 
@@ -125,7 +128,12 @@ class MessageStore(Protocol):
 class SqliteStore:
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
-        self._lock = threading.Lock()
+        # Publication and coordinator writes share one process-local gate.
+        # SQLite remains the cross-process authority. Reentrant so callbacks
+        # already inside a publication can use the same gate safely.
+        self._lock = WriterGate()
+        self._writer = WriteRuntime(self)
+        self._reads = ReadPool(self.db_path)
 
     def initialize(self) -> None:
         with self._lock:
@@ -216,22 +224,18 @@ class SqliteStore:
     ) -> CommitResult | None:
         """Fast replay/conflict check before HTTP; commit_add rechecks under its transaction."""
         user_id, request_id = messages[0].user_id, messages[0].request_id
-        with self._lock:
-            connection = self._connect()
-            try:
-                row = connection.execute(
-                    "SELECT payload_hash, response_json FROM add_requests WHERE user_id=? AND request_id=?",
-                    (user_id, request_id),
-                ).fetchone()
-                if row is not None:
-                    if row["payload_hash"] != payload_hash:
-                        return CommitResult(CommitStatus.CONFLICT)
-                    return CommitResult(CommitStatus.REPLAY, json.loads(row["response_json"]))
-                legacy = connection.execute(
-                    "SELECT 1 FROM raw_messages WHERE user_id=? AND request_id=? LIMIT 1", (user_id, request_id)
-                ).fetchone() is not None
-            finally:
-                connection.close()
+        with self._reads.snapshot() as connection:
+            row = connection.execute(
+                "SELECT payload_hash, response_json FROM add_requests WHERE user_id=? AND request_id=?",
+                (user_id, request_id),
+            ).fetchone()
+            if row is not None:
+                if row["payload_hash"] != payload_hash:
+                    return CommitResult(CommitStatus.CONFLICT)
+                return CommitResult(CommitStatus.REPLAY, json.loads(row["response_json"]))
+            legacy = connection.execute(
+                "SELECT 1 FROM raw_messages WHERE user_id=? AND request_id=? LIMIT 1", (user_id, request_id)
+            ).fetchone() is not None
         if legacy:
             # Reconcile the old ledger without adding new derived side effects.
             return self.commit_add(messages, payload_hash=payload_hash, response=response)
@@ -264,11 +268,21 @@ class SqliteStore:
         if any(message.user_id != user_id or message.request_id != request_id for message in messages):
             raise ValueError("all messages in an Add request must share user_id and request_id")
 
-        with self._lock:
-            lock_timeout = coordinator.lock_timeout_seconds if coordinator is not None else 30
-            connection = self._connect(timeout=lock_timeout)
+        # A heartbeat may renew while this request queues outside SQLite.
+        # Bound admission as well as BEGIN IMMEDIATE; never publish an expired
+        # lease after an unbounded RLock wait.
+        lock_timeout = coordinator.lock_timeout_seconds if coordinator is not None else 30
+        if coordinator is not None and not pure_control:
+            coordinator.prepare_readiness(user_id)
+        if not self._lock.acquire(timeout=lock_timeout):
+            raise NotReady('preparation_busy')
+        try:
+            connection = self._writer.connection(lock_timeout) if coordinator is not None else self._connect(timeout=lock_timeout)
+            if coordinator is not None:
+                self._writer.user = self._writer.key(user_id)
             try:
                 connection.execute("BEGIN IMMEDIATE")
+                append_prior = None
                 if coordinator is not None:
                     coordinator.fence_on(connection, lease)
                     if not pure_control:
@@ -284,6 +298,18 @@ class SqliteStore:
                         embedding is None or embedding.status != "ready" or
                         embedding.version != profile.model_version or embedding.dimensions != profile.dimensions):
                         raise NotReady("required_embedding_not_ready")
+                    # The prior summary describes this exact pre-write snapshot.
+                    # No other writer can commit until publication completes.
+                    # Complex lifecycle/research paths retain the full audit.
+                    if (not pure_control and span_pieces is not None and
+                        profile.identity['profile_version'] == 'k1-v1' and
+                        'dense' in profile.required_routes and
+                        set(profile.required_routes) <= {'raw','span','fts','dense','catalog'} and
+                        not claim_projection and not sentence_index and prepared_atoms is None and
+                        governance_plan is not None and not governance_plan.mutations and
+                        expected == messages and all(m.deletion_state == 'active' for m in messages) and
+                        segments.append_safe_triggers(connection)):
+                        append_prior = self._writer.get(connection, user_id, profile)
                 existing = connection.execute(
                     """
                     SELECT payload_hash, response_json
@@ -387,8 +413,12 @@ class SqliteStore:
                 if profile is not None and 'catalog' in profile.required_routes:
                     from app.evidence_catalog import sync
                     sync(connection, user_id)
-                write_publication_on(connection, user_id, request_id, profile)
+                delta_counts = (segments.append_counts(connection, user_id, profile, request_id, append_prior)
+                    if append_prior is not None else None)
+                publication_counts = write_publication_on(connection, user_id, request_id, profile,
+                    _counts=delta_counts)
                 if coordinator is not None:
+                    self._writer.remember(connection, user_id, profile, publication_counts)
                     if not pure_control:
                         coordinator.ready_on(connection, user_id)
                     coordinator.fence_on(connection, lease, published=True)
@@ -413,9 +443,16 @@ class SqliteStore:
             except Exception:
                 if connection.in_transaction:
                     connection.execute("ROLLBACK")
+                    if coordinator is not None:
+                        self._writer.invalidate_all()
                 raise
             finally:
-                connection.close()
+                if coordinator is None:
+                    connection.close()
+                else:
+                    self._writer.user = None
+        finally:
+            self._lock.release()
 
     def _insert_fts(self, connection: sqlite3.Connection, messages: list[RawMessage]) -> None:
         table_name = self._ensure_partition(connection, messages[0].user_id)
@@ -609,12 +646,8 @@ class SqliteStore:
     ) -> list[EvidenceCandidate]:
         if limit < 1:
             return []
-        with self._lock:
-            connection = self._connect()
-            try:
-                return self._lexical_on(connection, user_id, match_query, limit)
-            finally:
-                connection.close()
+        with self._reads.snapshot() as connection:
+            return self._lexical_on(connection, user_id, match_query, limit)
 
     @staticmethod
     def _lexical_on(connection: sqlite3.Connection, user_id: str, match_query: str | None, limit: int) -> list[EvidenceCandidate]:
@@ -633,25 +666,21 @@ class SqliteStore:
 
     def vector_coverage(self, user_id: str, version: str, dimensions: int, *, span=False) -> tuple[int, int]:
         """Cheap preflight to avoid model calls for unknown/incomplete users; search rechecks."""
-        with self._lock:
-            connection = self._connect()
-            try:
-                if span:
-                    row = connection.execute("""SELECT COUNT(*) AS total,COUNT(v.span_id) AS ready
-                        FROM source_spans s JOIN raw_messages m ON m.id=s.source_raw_id AND m.user_id=s.user_id
-                        LEFT JOIN span_vectors v ON v.span_id=s.id AND v.user_id=s.user_id
-                        AND v.embedding_version=? AND v.dimensions=?
-                        WHERE s.user_id=? AND m.deletion_state='active'""",(version,dimensions,user_id)).fetchone()
-                    return int(row["total"]),int(row["ready"])
-                row = connection.execute("""
-                    SELECT COUNT(*) AS total, COUNT(v.raw_id) AS ready
-                    FROM raw_messages m LEFT JOIN raw_vectors v
-                    ON v.raw_id=m.id AND v.user_id=m.user_id AND v.embedding_version=? AND v.dimensions=?
-                    WHERE m.user_id=? AND m.deletion_state='active'
-                """, (version, dimensions, user_id)).fetchone()
-                return int(row["total"]), int(row["ready"])
-            finally:
-                connection.close()
+        with self._reads.snapshot() as connection:
+            if span:
+                row = connection.execute("""SELECT COUNT(*) AS total,COUNT(v.span_id) AS ready
+                    FROM source_spans s JOIN raw_messages m ON m.id=s.source_raw_id AND m.user_id=s.user_id
+                    LEFT JOIN span_vectors v ON v.span_id=s.id AND v.user_id=s.user_id
+                    AND v.embedding_version=? AND v.dimensions=?
+                    WHERE s.user_id=? AND m.deletion_state='active'""",(version,dimensions,user_id)).fetchone()
+                return int(row["total"]),int(row["ready"])
+            row = connection.execute("""
+                SELECT COUNT(*) AS total, COUNT(v.raw_id) AS ready
+                FROM raw_messages m LEFT JOIN raw_vectors v
+                ON v.raw_id=m.id AND v.user_id=m.user_id AND v.embedding_version=? AND v.dimensions=?
+                WHERE m.user_id=? AND m.deletion_state='active'
+            """, (version, dimensions, user_id)).fetchone()
+            return int(row["total"]), int(row["ready"])
 
     def search_snapshot(
         self, *, user_id: str, match_query: str | None, query_vector: list[float] | None,
@@ -665,145 +694,112 @@ class SqliteStore:
         HTTP is completed before this method. Exact cosine scans only this
         user's active rows; another user's vectors cannot consume the quota.
         """
-        with self._lock:
-            connection = self._connect()
-            try:
-                connection.execute("BEGIN")
-                if span:
-                    return segments.search(connection,user_id,match_query,query_vector,version,dimensions,
-                                           mode,candidate_limit,lexical_quota,dense_quota,degraded_reason,
-                                           exact_acceleration=exact_acceleration)
-                if mode == "raw_fts":
-                    lexical = self._lexical_on(connection, user_id, match_query, candidate_limit)
-                    return RouteSnapshot(lexical, [], "raw_fts", None, 0, 0)
-                rows = connection.execute("""
-                    SELECT m.id, m.user_id, m.content, m.deletion_state, m.message_index,
-                           COALESCE(m.source_timestamp, m.recorded_at) AS created_at,
-                           v.vector_json, v.content_sha256
-                    FROM raw_messages m LEFT JOIN raw_vectors v
-                    ON v.raw_id=m.id AND v.user_id=m.user_id AND v.embedding_version=? AND v.dimensions=?
-                    WHERE m.user_id=? AND m.deletion_state='active'
-                """, (version, dimensions, user_id)).fetchall()
-                ready = sum(row["vector_json"] is not None for row in rows)
-                reason = degraded_reason
-                if rows and ready != len(rows):
-                    reason = reason or "incomplete_current_version"
-                if rows and query_vector is None:
-                    reason = reason or "query_vector_unavailable"
-                dense: list[EvidenceCandidate] = []
-                if rows and reason is None:
-                    try:
-                        query = normalize_vector(query_vector, dimensions)
-                        for row in rows:
-                            if row["content_sha256"] != hashlib.sha256(row["content"].encode("utf-8")).hexdigest():
-                                raise EmbeddingFailure("stale_vector_content")
-                            vector = normalize_vector(json.loads(row["vector_json"]), dimensions)
-                            score = max(-1.0, min(1.0, math.fsum(a * b for a, b in zip(query, vector))))
-                            dense.append(EvidenceCandidate(
-                                id=row["id"], user_id=row["user_id"], content=row["content"], score=score,
-                                created_at=row["created_at"], deletion_state=row["deletion_state"],
-                                source_raw_id=row["id"], message_index=row["message_index"],
-                            ))
-                    except (EmbeddingFailure, ValueError, TypeError):
-                        reason = "invalid_persisted_vector"
-                        dense = []
-                actual = "raw_fts" if reason else mode
-                if actual == "raw_fts":
-                    lexical = self._lexical_on(connection, user_id, match_query, candidate_limit)
-                    return RouteSnapshot(lexical, [], actual, reason, len(rows), ready)
-                dense.sort(key=lambda item: (-item.score, item.message_index, item.id))
-                dense = dense[:dense_quota if mode == "raw_hybrid_rrf" else candidate_limit]
-                lexical = self._lexical_on(connection, user_id, match_query, lexical_quota) if mode == "raw_hybrid_rrf" else []
-                return RouteSnapshot(lexical, dense, actual, None, len(rows), ready)
-            finally:
-                if connection.in_transaction:
-                    connection.execute("ROLLBACK")
-                connection.close()
+        with self._reads.snapshot() as connection:
+            if span:
+                return segments.search(connection,user_id,match_query,query_vector,version,dimensions,
+                                       mode,candidate_limit,lexical_quota,dense_quota,degraded_reason,
+                                       exact_acceleration=exact_acceleration)
+            if mode == "raw_fts":
+                lexical = self._lexical_on(connection, user_id, match_query, candidate_limit)
+                return RouteSnapshot(lexical, [], "raw_fts", None, 0, 0)
+            rows = connection.execute("""
+                SELECT m.id, m.user_id, m.content, m.deletion_state, m.message_index,
+                       COALESCE(m.source_timestamp, m.recorded_at) AS created_at,
+                       v.vector_json, v.content_sha256
+                FROM raw_messages m LEFT JOIN raw_vectors v
+                ON v.raw_id=m.id AND v.user_id=m.user_id AND v.embedding_version=? AND v.dimensions=?
+                WHERE m.user_id=? AND m.deletion_state='active'
+            """, (version, dimensions, user_id)).fetchall()
+            ready = sum(row["vector_json"] is not None for row in rows)
+            reason = degraded_reason
+            if rows and ready != len(rows):
+                reason = reason or "incomplete_current_version"
+            if rows and query_vector is None:
+                reason = reason or "query_vector_unavailable"
+            dense: list[EvidenceCandidate] = []
+            if rows and reason is None:
+                try:
+                    query = normalize_vector(query_vector, dimensions)
+                    for row in rows:
+                        if row["content_sha256"] != hashlib.sha256(row["content"].encode("utf-8")).hexdigest():
+                            raise EmbeddingFailure("stale_vector_content")
+                        vector = normalize_vector(json.loads(row["vector_json"]), dimensions)
+                        score = max(-1.0, min(1.0, math.fsum(a * b for a, b in zip(query, vector))))
+                        dense.append(EvidenceCandidate(
+                            id=row["id"], user_id=row["user_id"], content=row["content"], score=score,
+                            created_at=row["created_at"], deletion_state=row["deletion_state"],
+                            source_raw_id=row["id"], message_index=row["message_index"],
+                        ))
+                except (EmbeddingFailure, ValueError, TypeError):
+                    reason = "invalid_persisted_vector"
+                    dense = []
+            actual = "raw_fts" if reason else mode
+            if actual == "raw_fts":
+                lexical = self._lexical_on(connection, user_id, match_query, candidate_limit)
+                return RouteSnapshot(lexical, [], actual, reason, len(rows), ready)
+            dense.sort(key=lambda item: (-item.score, item.message_index, item.id))
+            dense = dense[:dense_quota if mode == "raw_hybrid_rrf" else candidate_limit]
+            lexical = self._lexical_on(connection, user_id, match_query, lexical_quota) if mode == "raw_hybrid_rrf" else []
+            return RouteSnapshot(lexical, dense, actual, None, len(rows), ready)
 
     def assemble_catalog_evidence(self, user_id, candidates, query, **budgets):
         from app.evidence_architecture import assemble
         from app.evidence_catalog import ready
-        with self._lock:
-            db = self._connect()
+        # A failed read-pool snapshot retires its handle. Retry only this
+        # specific FTS error once on a fresh transaction; do not rebuild, drop
+        # evidence, suppress persistent corruption, or bypass the final fence.
+        for attempt in range(2):
             try:
-                db.execute("BEGIN")
-                if not ready(db, user_id):
-                    raise NotReady('incomplete_catalog_route')
-                return assemble(db,user_id,candidates,query,**budgets)
-            finally:
-                if db.in_transaction:
-                    db.execute("ROLLBACK")
-                db.close()
+                with self._reads.snapshot() as db:
+                    if not ready(db, user_id):
+                        raise NotReady('incomplete_catalog_route')
+                    return assemble(db,user_id,candidates,query,**budgets)
+            except sqlite3.DatabaseError as exc:
+                if attempt or getattr(exc,'sqlite_errorcode',None) != sqlite3.SQLITE_CORRUPT_VTAB:
+                    raise
+                from app import diagnostics as diagnostic
+                diagnostic.emit('snapshot_retry',reason='catalog_read_reopened',attempt=1,exc=exc)
 
     def expand_evidence_units(self, user_id, candidates, limit=200, **budgets):
         from app.evidence_units import expand_units
-        with self._lock:
-            db = self._connect()
-            try:
-                db.execute("BEGIN")
-                return expand_units(db, user_id, candidates, limit=limit, **budgets)
-            finally:
-                if db.in_transaction:
-                    db.rollback()
-                db.close()
+        with self._reads.snapshot() as db:
+            return expand_units(db, user_id, candidates, limit=limit, **budgets)
 
     def expand_span_windows(self,user_id,candidates,limit=200):
         from app.support_groups import span_windows
-        with self._lock:
-            db=self._connect()
-            try:
-                db.execute("BEGIN")
-                return span_windows(db,user_id,candidates,limit)
-            finally:
-                if db.in_transaction:db.rollback()
-                db.close()
+        with self._reads.snapshot() as db:
+            return span_windows(db,user_id,candidates,limit)
 
     def project_span_claims(self,user_id,candidates,view):
         from app.claim_projection import project_claims
-        with self._lock:
-            db=self._connect()
-            try:
-                db.execute("BEGIN")
-                return project_claims(db,user_id,candidates,view)
-            finally:
-                if db.in_transaction:db.rollback()
-                db.close()
+        with self._reads.snapshot() as db:
+            return project_claims(db,user_id,candidates,view)
 
     def sentence_candidates(self,user_id,match_query,limit):
         from app.evidence_navigation import search
-        with self._lock:
-            db=self._connect()
-            try:return search(db,user_id,match_query,limit)
-            finally:db.close()
+        with self._reads.snapshot() as db:
+            return search(db,user_id,match_query,limit)
 
     def atom_candidates(self,user_id,query,limit,extractor_version):
         from app.atomic_memory import search_atoms
-        with self._lock:
-            db=self._connect()
-            try:return search_atoms(db,user_id,query,limit,extractor_version=extractor_version,candidate_limit=limit)
-            finally:db.close()
+        with self._reads.snapshot() as db:
+            return search_atoms(db,user_id,query,limit,extractor_version=extractor_version,candidate_limit=limit)
 
     def atom_dense_candidates(self,user_id,query_vector,version,dimensions,limit,extractor_version):
         from app.atomic_memory import search_atom_dense
-        with self._lock:
-            db=self._connect()
-            try:return search_atom_dense(db,user_id,query_vector,version,dimensions,extractor_version,
-                limit,candidate_limit=limit)
-            finally:db.close()
+        with self._reads.snapshot() as db:
+            return search_atom_dense(db,user_id,query_vector,version,dimensions,extractor_version,
+            limit,candidate_limit=limit)
 
     def atom_display_groups(self,user_id,candidates,extractor_version):
         from app.atomic_memory import atom_support_groups
-        with self._lock:
-            db=self._connect()
-            try:return atom_support_groups(db,user_id,candidates,extractor_version=extractor_version,enabled=True)
-            finally:db.close()
+        with self._reads.snapshot() as db:
+            return atom_support_groups(db,user_id,candidates,extractor_version=extractor_version,enabled=True)
 
     def expand_evidence(self,user_id,candidates,*,parents=False,radius=0,limit=200):
         from app.evidence_navigation import expand
-        with self._lock:
-            db=self._connect()
-            try:return expand(db,user_id,candidates,parents=parents,radius=radius,limit=limit)
-            finally:db.close()
+        with self._reads.snapshot() as db:
+            return expand(db,user_id,candidates,parents=parents,radius=radius,limit=limit)
 
     def context_neighbors(self, user_id: str, candidates: list[EvidenceCandidate], radius: int, limit: int, historical: bool = False) -> list[EvidenceCandidate]:
         """Bounded session-local context, anchored only on a still-eligible hit.
@@ -811,109 +807,87 @@ class SqliteStore:
         Source order is committed SQLite row order, not event time or a parsed
         request ID. This optional heuristic is not task-state inference.
         """
-        with self._lock:
-            db = self._connect()
-            try:
-                db.execute("BEGIN")
-                cache, result, seen = {}, [], set()
-                for seed in candidates:
-                    source = db.execute("""SELECT m.session_id,p.retraction_state FROM raw_messages m JOIN source_policies p
-                        ON m.id=p.raw_id AND m.user_id=p.user_id
-                        WHERE m.user_id=? AND m.id=? AND m.content=? AND m.deletion_state='active'
-                          AND p.visibility='visible' AND p.disclosure_policy='within_user'
-                          AND (p.retraction_state='not_retracted' OR ?=1)""", (user_id,seed.id,seed.content,int(historical))).fetchone()
-                    if source is None:
-                        continue
-                    session = source["session_id"]
-                    if session not in cache:
-                        cache[session] = db.execute("""SELECT m.id,m.content,m.message_index,m.deletion_state,
-                                COALESCE(m.source_timestamp,m.recorded_at) AS created_at
-                            FROM raw_messages m WHERE m.user_id=? AND m.session_id=? ORDER BY m.rowid""",
-                            (user_id,session)).fetchall()
-                    rows = cache[session]
-                    position = next((i for i,r in enumerate(rows) if r["id"]==seed.id),None)
-                    if position is None:
-                        continue
-                    nearby = [seed]
-                    for offset in range(1,radius+1):
-                        for index in (position- offset,position+offset):
-                            if 0<=index<len(rows):
-                                row=rows[index]
-                                if row["deletion_state"] != "active":
-                                    continue
-                                nearby.append(EvidenceCandidate(
-                                    id=row["id"],user_id=user_id,content=row["content"],score=seed.score,
-                                    created_at=row["created_at"],deletion_state=row["deletion_state"],
-                                    source_raw_id=row["id"],message_index=row["message_index"]))
-                    for item in nearby:
-                        if item.id not in seen:
-                            seen.add(item.id)
-                            result.append(item)
-                            if len(result)==limit:
-                                return result
-                return result
-            finally:
-                if db.in_transaction:
-                    db.execute("ROLLBACK")
-                db.close()
+        with self._reads.snapshot() as db:
+            cache, result, seen = {}, [], set()
+            for seed in candidates:
+                source = db.execute("""SELECT m.session_id,p.retraction_state FROM raw_messages m JOIN source_policies p
+                    ON m.id=p.raw_id AND m.user_id=p.user_id
+                    WHERE m.user_id=? AND m.id=? AND m.content=? AND m.deletion_state='active'
+                      AND p.visibility='visible' AND p.disclosure_policy='within_user'
+                      AND (p.retraction_state='not_retracted' OR ?=1)""", (user_id,seed.id,seed.content,int(historical))).fetchone()
+                if source is None:
+                    continue
+                session = source["session_id"]
+                if session not in cache:
+                    cache[session] = db.execute("""SELECT m.id,m.content,m.message_index,m.deletion_state,
+                            COALESCE(m.source_timestamp,m.recorded_at) AS created_at
+                        FROM raw_messages m WHERE m.user_id=? AND m.session_id=? ORDER BY m.rowid""",
+                        (user_id,session)).fetchall()
+                rows = cache[session]
+                position = next((i for i,r in enumerate(rows) if r["id"]==seed.id),None)
+                if position is None:
+                    continue
+                nearby = [seed]
+                for offset in range(1,radius+1):
+                    for index in (position- offset,position+offset):
+                        if 0<=index<len(rows):
+                            row=rows[index]
+                            if row["deletion_state"] != "active":
+                                continue
+                            nearby.append(EvidenceCandidate(
+                                id=row["id"],user_id=user_id,content=row["content"],score=seed.score,
+                                created_at=row["created_at"],deletion_state=row["deletion_state"],
+                                source_raw_id=row["id"],message_index=row["message_index"]))
+                for item in nearby:
+                    if item.id not in seen:
+                        seen.add(item.id)
+                        result.append(item)
+                        if len(result)==limit:
+                            return result
+            return result
 
     def has_erased_statements(self, messages: list[RawMessage]) -> bool:
-        with self._lock:
-            db = self._connect()
-            try:
-                return any(db.execute(
-                    "SELECT 1 FROM memory_tombstones WHERE user_id=? AND statement_sha256=? LIMIT 1",
-                    (message.user_id, statement_digest(message.content))).fetchone() for message in messages)
-            finally:
-                db.close()
+        with self._reads.snapshot() as db:
+            return any(db.execute(
+                "SELECT 1 FROM memory_tombstones WHERE user_id=? AND statement_sha256=? LIMIT 1",
+                (message.user_id, statement_digest(message.content))).fetchone() for message in messages)
 
     def lifecycle_receipts(self, user_id: str, request_id: str) -> list[dict]:
-        with self._lock:
-            db = self._connect()
-            try:
-                return operation_receipts(db,user_id,request_id)
-            finally:
-                db.close()
+        with self._reads.snapshot() as db:
+            return operation_receipts(db,user_id,request_id)
 
     def policy_snapshot(self, user_id: str, candidates: list[EvidenceCandidate], *, historical: bool = False):
         from app.safety import PolicySnapshot, SourcePolicy
-        with self._lock:
-            db = self._connect()
-            try:
-                db.execute("BEGIN")
-                row = db.execute("SELECT epoch FROM lifecycle_users WHERE user_id=?", (user_id,)).fetchone()
-                epoch = int(row[0]) if row else 0
-                policies = {}
-                for candidate in candidates:
-                    source = db.execute("""SELECT p.*,m.*
-                        FROM source_policies p JOIN raw_messages m ON m.id=p.raw_id AND m.user_id=p.user_id
-                        WHERE p.user_id=? AND p.raw_id=?""", (user_id,candidate.source_raw_id)).fetchone()
-                    if source is not None:
-                        expected_content = source["content"]
-                        if candidate.representation == "attributed_raw_v1" and source["retraction_state"] == "retracted" and historical:
-                            from app.rendering import render_retracted_source
-                            expected_content = render_retracted_source(raw_id=source["raw_id"],content=source["content"],
-                                                                      role=source["role"],timestamp=source["source_timestamp"])
-                        content_valid = (candidate.id == candidate.source_raw_id
-                                         and candidate.content == expected_content
-                                         and hashlib.sha256(source["content"].encode("utf-8")).hexdigest() == source["content_sha256"]
-                                         and (source["retraction_state"] != "retracted" or candidate.representation == "attributed_raw_v1"))
-                        if candidate.representation == "span_exact_v1":
-                            content_valid = segments.valid_candidate(db,candidate,source) and source["retraction_state"] != "retracted"
-                        elif candidate.representation == "evidence_block_v1":
-                            from app.evidence_catalog import valid_candidate
-                            content_valid = valid_candidate(db,candidate,source)
-                        policies[candidate.source_raw_id] = SourcePolicy(
-                            user_id=user_id,raw_id=candidate.source_raw_id,
-                            version=int(source["source_version"]),
-                            visibility=source["visibility"] if source["deletion_state"] == "active" else "suppressed",
-                            disclosure_policy=source["disclosure_policy"] if source["privacy_level"] == "normal" else "restricted",
-                            retraction_state=source["retraction_state"], content_valid=content_valid)
-                return PolicySnapshot(epoch,policies,allow_historical=historical)
-            finally:
-                if db.in_transaction:
-                    db.execute("ROLLBACK")
-                db.close()
+        with self._reads.snapshot() as db:
+            row = db.execute("SELECT epoch FROM lifecycle_users WHERE user_id=?", (user_id,)).fetchone()
+            epoch = int(row[0]) if row else 0
+            policies = {}
+            for candidate in candidates:
+                source = db.execute("""SELECT p.*,m.*
+                    FROM source_policies p JOIN raw_messages m ON m.id=p.raw_id AND m.user_id=p.user_id
+                    WHERE p.user_id=? AND p.raw_id=?""", (user_id,candidate.source_raw_id)).fetchone()
+                if source is not None:
+                    expected_content = source["content"]
+                    if candidate.representation == "attributed_raw_v1" and source["retraction_state"] == "retracted" and historical:
+                        from app.rendering import render_retracted_source
+                        expected_content = render_retracted_source(raw_id=source["raw_id"],content=source["content"],
+                                                                  role=source["role"],timestamp=source["source_timestamp"])
+                    content_valid = (candidate.id == candidate.source_raw_id
+                                     and candidate.content == expected_content
+                                     and hashlib.sha256(source["content"].encode("utf-8")).hexdigest() == source["content_sha256"]
+                                     and (source["retraction_state"] != "retracted" or candidate.representation == "attributed_raw_v1"))
+                    if candidate.representation == "span_exact_v1":
+                        content_valid = segments.valid_candidate(db,candidate,source) and source["retraction_state"] != "retracted"
+                    elif candidate.representation == "evidence_block_v1":
+                        from app.evidence_catalog import valid_candidate
+                        content_valid = valid_candidate(db,candidate,source)
+                    policies[candidate.source_raw_id] = SourcePolicy(
+                        user_id=user_id,raw_id=candidate.source_raw_id,
+                        version=int(source["source_version"]),
+                        visibility=source["visibility"] if source["deletion_state"] == "active" else "suppressed",
+                        disclosure_policy=source["disclosure_policy"] if source["privacy_level"] == "normal" else "restricted",
+                        retraction_state=source["retraction_state"], content_valid=content_valid)
+            return PolicySnapshot(epoch,policies,allow_historical=historical)
 
     def governed_candidates(self, user_id: str, candidates: list[EvidenceCandidate],
                             view: TemporalView, limit: int) -> list[EvidenceCandidate]:
@@ -922,86 +896,82 @@ class SqliteStore:
         Returns raw text; only a fully parsed, single-claim source can be excluded
         by a temporal view. No derived summary is asserted as an answer.
         """
-        with self._lock:
-            db = self._connect()
-            try:
-                db.execute("BEGIN")
-                epoch_row = db.execute("SELECT epoch FROM lifecycle_users WHERE user_id=?", (user_id,)).fetchone()
-                selection_epoch = int(epoch_row[0]) if epoch_row else 0
-                result, seen = [], set()
-                invalid_derived_ids = []
-                for seed in candidates:
-                    seed_claims = db.execute("""SELECT * FROM derived_memories
-                        WHERE user_id=? AND source_raw_id=? AND admission='accepted'""",
-                        (user_id,seed.source_raw_id)).fetchall()
-                    invalid_seed = [row["id"] for row in seed_claims if not valid_derived_source(db,row)]
-                    invalid_derived_ids.extend(invalid_seed)
-                    if invalid_seed:
-                        seed_claims = []
-                    additions = []
-                    for keyrow in seed_claims:
-                        rows = db.execute("""SELECT d.*,m.id AS raw_id,m.user_id,m.content,m.deletion_state,m.message_index,
-                                    COALESCE(m.source_timestamp,m.recorded_at) AS created_at,m.role,m.source_timestamp
-                            FROM derived_memories d JOIN raw_messages m ON m.id=d.source_raw_id AND m.user_id=d.user_id
-                            WHERE d.user_id=? AND d.claim_key=? AND d.admission='accepted'
-                              AND d.visibility='visible' AND m.deletion_state='active'
-                            ORDER BY CASE WHEN d.valid_from IS NULL THEN 1 ELSE 0 END,d.valid_from DESC,d.id""",
-                            (user_id,keyrow["claim_key"])).fetchall()
-                        invalid_group = [row["id"] for row in rows if not valid_derived_source(db,row)]
-                        if invalid_group:
-                            # Do not apply cached supersession from an invalid
-                            # successor. Fall back to the original, gated raw hit.
-                            invalid_derived_ids.extend(invalid_group)
-                            additions = [seed]
-                            break
-                        for row in rows:
-                            if view.intent == "current" and row["currency"] == "superseded":
-                                continue
-                            if view.intent == "as_of" and (
-                                (row["valid_from"] is not None and row["valid_from"] > view.as_of) or
-                                (row["valid_until"] is not None and row["valid_until"] <= view.as_of)):
-                                continue
-                            content,representation = row["content"],"raw"
-                            if row["retraction_state"] == "retracted" and view.intent in {"history","as_of"}:
-                                from app.rendering import render_retracted_source
-                                content = render_retracted_source(raw_id=row["raw_id"],content=content,role=row["role"],timestamp=row["source_timestamp"])
-                                representation = "attributed_raw_v1"
-                            additions.append(EvidenceCandidate(
-                                id=row["raw_id"],user_id=user_id,content=content,score=seed.score,representation=representation,
-                                created_at=row["created_at"],deletion_state=row["deletion_state"],
-                                source_raw_id=row["raw_id"],message_index=row["message_index"]))
-                    if not seed_claims:
+        with self._reads.snapshot() as db:
+            epoch_row = db.execute("SELECT epoch FROM lifecycle_users WHERE user_id=?", (user_id,)).fetchone()
+            selection_epoch = int(epoch_row[0]) if epoch_row else 0
+            result, seen = [], set()
+            invalid_derived_ids = []
+            for seed in candidates:
+                seed_claims = db.execute("""SELECT * FROM derived_memories
+                    WHERE user_id=? AND source_raw_id=? AND admission='accepted'""",
+                    (user_id,seed.source_raw_id)).fetchall()
+                invalid_seed = [row["id"] for row in seed_claims if not valid_derived_source(db,row)]
+                invalid_derived_ids.extend(invalid_seed)
+                if invalid_seed:
+                    seed_claims = []
+                additions = []
+                for keyrow in seed_claims:
+                    rows = db.execute("""SELECT d.*,m.id AS raw_id,m.user_id,m.content,m.deletion_state,m.message_index,
+                                COALESCE(m.source_timestamp,m.recorded_at) AS created_at,m.role,m.source_timestamp
+                        FROM derived_memories d JOIN raw_messages m ON m.id=d.source_raw_id AND m.user_id=d.user_id
+                        WHERE d.user_id=? AND d.claim_key=? AND d.admission='accepted'
+                          AND d.visibility='visible' AND m.deletion_state='active'
+                        ORDER BY CASE WHEN d.valid_from IS NULL THEN 1 ELSE 0 END,d.valid_from DESC,d.id""",
+                        (user_id,keyrow["claim_key"])).fetchall()
+                    invalid_group = [row["id"] for row in rows if not valid_derived_source(db,row)]
+                    if invalid_group:
+                        # Do not apply cached supersession from an invalid
+                        # successor. Fall back to the original, gated raw hit.
+                        invalid_derived_ids.extend(invalid_group)
                         additions = [seed]
-                    elif view.intent == "all":
-                        additions = [seed] + additions
-                    for hit in additions:
-                        if view.intent in {"history","as_of"} and hit.representation == "raw":
-                            source = db.execute("""SELECT m.role,m.source_timestamp,p.retraction_state FROM raw_messages m
-                                JOIN source_policies p ON p.raw_id=m.id AND p.user_id=m.user_id
-                                WHERE m.id=? AND m.user_id=?""",(hit.source_raw_id,user_id)).fetchone()
-                            if source and source["retraction_state"] == "retracted":
-                                from app.rendering import render_retracted_source
-                                hit=hit.model_copy(update={"representation":"attributed_raw_v1","content":render_retracted_source(
-                                    raw_id=hit.source_raw_id,content=hit.content,role=source["role"],timestamp=source["source_timestamp"])})
-                        if hit.id not in seen:
-                            result.append(hit)
-                            seen.add(hit.id)
-                            if len(result) == limit:
-                                return GovernedSelection(result,selection_epoch,invalid_derived_ids)
-                return GovernedSelection(result,selection_epoch,invalid_derived_ids)
-            finally:
-                if db.in_transaction:
-                    db.execute("ROLLBACK")
-                db.close()
+                        break
+                    for row in rows:
+                        if view.intent == "current" and row["currency"] == "superseded":
+                            continue
+                        if view.intent == "as_of" and (
+                            (row["valid_from"] is not None and row["valid_from"] > view.as_of) or
+                            (row["valid_until"] is not None and row["valid_until"] <= view.as_of)):
+                            continue
+                        content,representation = row["content"],"raw"
+                        if row["retraction_state"] == "retracted" and view.intent in {"history","as_of"}:
+                            from app.rendering import render_retracted_source
+                            content = render_retracted_source(raw_id=row["raw_id"],content=content,role=row["role"],timestamp=row["source_timestamp"])
+                            representation = "attributed_raw_v1"
+                        additions.append(EvidenceCandidate(
+                            id=row["raw_id"],user_id=user_id,content=content,score=seed.score,representation=representation,
+                            created_at=row["created_at"],deletion_state=row["deletion_state"],
+                            source_raw_id=row["raw_id"],message_index=row["message_index"]))
+                if not seed_claims:
+                    additions = [seed]
+                elif view.intent == "all":
+                    additions = [seed] + additions
+                for hit in additions:
+                    if view.intent in {"history","as_of"} and hit.representation == "raw":
+                        source = db.execute("""SELECT m.role,m.source_timestamp,p.retraction_state FROM raw_messages m
+                            JOIN source_policies p ON p.raw_id=m.id AND p.user_id=m.user_id
+                            WHERE m.id=? AND m.user_id=?""",(hit.source_raw_id,user_id)).fetchone()
+                        if source and source["retraction_state"] == "retracted":
+                            from app.rendering import render_retracted_source
+                            hit=hit.model_copy(update={"representation":"attributed_raw_v1","content":render_retracted_source(
+                                raw_id=hit.source_raw_id,content=hit.content,role=source["role"],timestamp=source["source_timestamp"])})
+                    if hit.id not in seen:
+                        result.append(hit)
+                        seen.add(hit.id)
+                        if len(result) == limit:
+                            return GovernedSelection(result,selection_epoch,invalid_derived_ids)
+            return GovernedSelection(result,selection_epoch,invalid_derived_ids)
 
     def _connect(self, timeout: float = 30) -> sqlite3.Connection:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(self.db_path, timeout=timeout)
+        connection = sqlite3.connect(self.db_path, timeout=timeout, check_same_thread=False, cached_statements=0)
         connection.row_factory = sqlite3.Row
         connection.isolation_level = None
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA secure_delete = ON")
-        connection.execute("PRAGMA journal_mode = WAL")
+        # Reading an existing WAL mode avoids repeatedly requesting a journal
+        # mode transition on every short-lived Search/control connection.
+        if connection.execute("PRAGMA journal_mode").fetchone()[0].lower() != 'wal':
+            connection.execute("PRAGMA journal_mode = WAL")
         return connection
 
 

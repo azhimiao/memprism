@@ -1,0 +1,23 @@
+{
+  "system": "Memprism",
+  "submitted_version_label": "memprism-hybrid-037",
+  "competition": "AML Cycle 2",
+  "track": "textual",
+  "division": "open_source_methods",
+  "phase": "full",
+  "status": "succeeded",
+  "stage": "completed",
+  "completed": 9602,
+  "total": 9602,
+  "branch_completed": {
+    "textual": 5609,
+    "streaming": 3993
+  },
+  "status_observed_utc": "2026-11-05T01:58:21Z",
+  "reported_score": 48,
+  "score_source": "participant_report_2026-11-05",
+  "exact_decimal_score_independently_verified": false,
+  "public_rank": null,
+  "organizer_review_status": "not_verified",
+  "snapshot_scope": "runtime_at_completion; original task included repairs and resumptions"
+}

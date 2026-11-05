@@ -13,6 +13,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
+from contextvars import copy_context
 
 from app.embeddings import EmbeddingBatch, EmbeddingFailure, normalize_vector
 from app.governance import statement_digest
@@ -185,7 +186,7 @@ def route_counts_on(db, user_id, profile):
     return counts
 
 
-def write_publication_on(db, user_id, request_id, profile=None):
+def write_publication_on(db, user_id, request_id, profile=None, *, _counts=None):
     """Called by every Add (including research), inside the publish transaction."""
     db.execute("""INSERT INTO k0_users VALUES (?,1)
         ON CONFLICT(user_id) DO UPDATE SET commit_seq=commit_seq+1""", (user_id,))
@@ -195,7 +196,10 @@ def write_publication_on(db, user_id, request_id, profile=None):
     if 'catalog' in profile.required_routes:
         from app.evidence_catalog import certify_on
         certify_on(db,user_id,profile.config_hash)
-    counts = route_counts_on(db, user_id, profile)
+    counts = route_counts_on(db, user_id, profile) if _counts is None else dict(_counts)
+    if _counts is not None and 'catalog' in profile.required_routes:
+        from app.evidence_catalog import ready as catalog_ready
+        counts['catalog'] = counts['active'] if catalog_ready(db,user_id,profile.config_hash) else -1
     for route in profile.required_routes:
         ready = counts[route] == counts["active"] and (route != "dense" or profile.dimensions > 0)
         db.execute("INSERT OR REPLACE INTO k0_watermarks VALUES (?,?,?,?,?,?)",
@@ -203,29 +207,63 @@ def write_publication_on(db, user_id, request_id, profile=None):
     db.execute("INSERT INTO k0_receipts VALUES (?,?,?,?,?,?,?,?)",
                (user_id, request_id, profile.config_hash, profile.profile_id,
                 json.dumps(profile.required_routes), profile.model_version, seq, epoch))
+    return counts
 
 
 class JobCoordinator:
     def __init__(self, store, profile, *, lock_timeout_seconds: float = 30.0):
         self.store, self.profile = store, profile
         self.lock_timeout_seconds = lock_timeout_seconds
+        self.pooled_control_reads = False
+        from app.read_readiness import ReadReadiness
+        self._read_readiness = ReadReadiness(store)
 
     @contextmanager
-    def transaction(self, write=True, *, timeout_seconds=None):
+    def transaction(self, write=True, *, timeout_seconds=None, priority=False):
+        if not write and self.pooled_control_reads and self.store._reads.path == self.store.db_path:
+            try:
+                with self.store._reads.snapshot() as reader:
+                    yield reader
+            except sqlite3.Error as exc:
+                failure = NotReady("control_not_ready")
+                code = getattr(exc, 'sqlite_errorcode', None)
+                if type(code) is int:
+                    failure.sqlite_errorcode = code
+                raise failure from None
+            return
         db = None
+        acquired = False
         try:
             timeout = self.lock_timeout_seconds if timeout_seconds is None else min(self.lock_timeout_seconds, timeout_seconds)
-            db = self.store._connect(timeout=timeout)
+            started = time.monotonic()
+            if write:
+                acquired = self.store._lock.acquire(timeout=max(0, timeout), priority=priority)
+                if not acquired:
+                    raise NotReady("preparation_busy")
+                timeout = max(0, timeout - (time.monotonic() - started))
+            db = self.store._writer.connection(timeout) if write else self.store._connect(timeout=timeout)
             db.execute("BEGIN IMMEDIATE" if write else "BEGIN")
             yield db
             db.execute("COMMIT")
-        except sqlite3.Error:
-            raise NotReady("control_not_ready") from None
+        except sqlite3.Error as exc:
+            failure = NotReady("control_not_ready")
+            code = getattr(exc, 'sqlite_errorcode', None)
+            if type(code) is int:
+                failure.sqlite_errorcode = code
+            raise failure from None
         finally:
-            if db is not None and db.in_transaction:
-                db.execute("ROLLBACK")
-            if db is not None:
-                db.close()
+            try:
+                if db is not None and db.in_transaction:
+                    db.execute("ROLLBACK")
+                    if write:
+                        self.store._writer.invalidate_all()
+            finally:
+                try:
+                    if db is not None and not write:
+                        db.close()
+                finally:
+                    if acquired:
+                        self.store._lock.release()
 
     def activate(self):
         with self.transaction() as db:
@@ -260,16 +298,23 @@ class JobCoordinator:
                 required.append("span_vectors")
         if "atom" in self.profile.required_routes:
             required.extend(("atomic_memories", "atomic_extractions", "atomic_fts_partitions"))
-        present = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        present = {row[0] for row in db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN ("+
+            ','.join('?' for _ in required)+')', required)}
         if any(name not in present for name in required):
             raise NotReady("control_not_ready")
         return generation
 
-    def ready_on(self, db, user_id, *, require_proof=True):
+    def ready_on(self, db, user_id, *, require_proof=True, _counts=None):
         generation = self.config_on(db)
         if "dense" in self.profile.required_routes and self.profile.dimensions == 0:
             raise NotReady("missing_configuration")
-        counts = route_counts_on(db, user_id, self.profile)
+        writer = self.store._writer
+        counts = _counts if _counts is not None else (writer.get(db, user_id, self.profile) if db is writer.db else None)
+        if counts is None:
+            counts = route_counts_on(db, user_id, self.profile)
+            if db is writer.db:
+                writer.remember(db, user_id, self.profile, counts)
         epoch, seq = epoch_on(db, user_id), seq_on(db, user_id)
         for route in self.profile.required_routes:
             if counts[route] != counts["active"]:
@@ -281,9 +326,61 @@ class JobCoordinator:
                 raise NotReady("route_rebuild_required")
         return (generation, epoch, seq)
 
+    def prepare_readiness(self, user_id):
+        """Audit outside the writer gate, then accept only an unchanged snapshot.
+
+        The short IMMEDIATE transaction anchors the separate read snapshot while
+        preventing an unobserved external writer between the two observations.
+        Own lease/attempt commits do not change this connection's data_version.
+        """
+        writer = self.store._writer
+        for _ in range(3):
+            # Open/warm outside the writer gate. Reset before pinning against
+            # the writer's exact stamp; pooled readers retain schema only.
+            from contextlib import closing
+            pooled = self.pooled_control_reads and self.store._reads.path == self.store.db_path
+            reader_scope = self.store._reads.snapshot() if pooled else closing(self.store._connect())
+            with reader_scope as reader:
+                reader.execute('SELECT COUNT(*) FROM k0_config').fetchone()
+                if reader.in_transaction:
+                    reader.execute('ROLLBACK')
+                with self.transaction() as db:
+                    cached = writer.get(db, user_id, self.profile)
+                    if cached is not None:
+                        return writer.stamp(db, user_id, self.profile), cached
+                    stamp = writer.stamp(db, user_id, self.profile)
+                    reader.execute('BEGIN')
+                    reader.execute('SELECT COUNT(*) FROM k0_config').fetchone()
+                counts = route_counts_on(reader, user_id, self.profile)
+            with self.transaction() as db:
+                if writer.stamp(db, user_id, self.profile) == stamp:
+                    writer.remember(db, user_id, self.profile, counts)
+                    return stamp, counts
+        raise NotReady('preparation_busy')
+
+    def health_ready(self):
+        """Check current controls and per-user actual-data summaries atomically."""
+        for _ in range(3):
+            with self.transaction(False) as db:
+                users = [r[0] for r in db.execute('SELECT DISTINCT user_id FROM raw_messages')
+                         if isinstance(r[0], str) and r[0].strip()]
+            # Temporary proofs also support more users than the persistent LRU.
+            proofs = {user: self.prepare_readiness(user) for user in users}
+            with self.transaction() as db:
+                self.control_ready_on(db)
+                current = [r[0] for r in db.execute('SELECT DISTINCT user_id FROM raw_messages')
+                           if isinstance(r[0], str) and r[0].strip()]
+                if set(current) != set(users):
+                    continue
+                if any(self.store._writer.stamp(db, user, self.profile) != proofs[user][0] for user in users):
+                    continue
+                for user in users:
+                    self.ready_on(db, user, _counts=proofs[user][1])
+                return
+        raise NotReady('health_snapshot_changed')
+
     def require_ready(self, user_id):
-        with self.transaction(False) as db:
-            return self.ready_on(db, user_id)
+        return self._read_readiness.require(self, user_id)
 
     def certify_routes(self, user_id):
         """Explicit no-HTTP validation of an already rebuilt COPY, with audit proof.
@@ -318,6 +415,30 @@ class JobCoordinator:
                 raise NotReady("preparation_busy") from None
             raise
 
+    def _preparing_elsewhere_on(self, db, user_id, request_id, payload_hash, has_messages):
+        """Read-only wait hint; the write transaction still rechecks everything."""
+        generation = self.config_on(db)
+        receipt = db.execute("SELECT payload_hash FROM add_requests WHERE user_id=? AND request_id=?",
+                             (user_id, request_id)).fetchone()
+        own = db.execute("SELECT * FROM k0_jobs WHERE user_id=? AND request_id=?",
+                         (user_id, request_id)).fetchone()
+        if ((receipt and receipt['payload_hash'] != payload_hash)
+                or (own and own['payload_hash'] != payload_hash)):
+            raise PayloadConflict("request_id has already been used with a different Add payload")
+        if receipt:
+            return False
+        if has_messages and db.execute("SELECT 1 FROM raw_messages WHERE user_id=? AND request_id=? LIMIT 1",
+                                       (user_id, request_id)).fetchone():
+            return False
+        now = time.time()
+        if own and own['state'] == 'preparing' and own['expires_at'] > now and own['config_generation'] == generation:
+            return False
+        return db.execute("""SELECT 1 FROM k0_jobs WHERE user_id=? AND request_id!=?
+            AND state='preparing' AND expires_at>? AND config_generation=?
+            AND config_hash=? AND source_epoch=? LIMIT 1""",
+            (user_id, request_id, now, generation, self.profile.config_hash,
+             epoch_on(db, user_id))).fetchone() is not None
+
     def reserve(self, user_id, request_id, payload_hash, *, pure_control=False, messages=None, response=None):
         deadline = time.monotonic() + COMPETITION_WAIT
         user_deadline = time.monotonic() + USER_PREPARATION_WAIT
@@ -327,6 +448,17 @@ class JobCoordinator:
             remaining = wait_deadline - time.monotonic()
             if remaining <= 0:
                 raise NotReady("preparation_busy")
+            if serialized:
+                # A queued request must not acquire SQLite's writer reservation
+                # every 50ms. This is a hint, never an authorization decision.
+                with self.transaction(False, timeout_seconds=remaining) as waiting_db:
+                    waiting = self._preparing_elsewhere_on(
+                        waiting_db, user_id, request_id, payload_hash, messages is not None)
+                if waiting:
+                    time.sleep(min(0.05, max(0, wait_deadline - time.monotonic())))
+                    continue
+            if not pure_control:
+                self.prepare_readiness(user_id)
             with self._reservation_transaction(wait_deadline) as db:
                 if time.monotonic() >= wait_deadline:
                     raise NotReady("preparation_busy")
@@ -401,17 +533,18 @@ class JobCoordinator:
             raise SnapshotChanged("source_epoch_changed")
 
     def renew(self, lease):
-        with self.transaction() as db:
+        with self.transaction(priority=True) as db:
             self.fence_on(db, lease)
             db.execute("UPDATE k0_jobs SET expires_at=? WHERE user_id=? AND request_id=?",
                        (time.time() + LEASE_TTL, lease.user_id, lease.request_id))
 
     def draft(self, lease, messages, plan):
-        with self.transaction() as db:
+        with self.transaction(False) as db:
             self.fence_on(db, lease)
             return embedding_messages_on(db, messages, plan)
 
     def permit(self, lease, messages, plan, batch):
+        self.prepare_readiness(lease.user_id)
         with self.transaction() as db:
             self.fence_on(db, lease)
             self.ready_on(db, lease.user_id)
@@ -439,6 +572,7 @@ class JobCoordinator:
         """
         from app.atomic_memory import source_hash
         from app.memory_core import planned_source_state
+        self.prepare_readiness(lease.user_id)
         with self.transaction() as db:
             self.fence_on(db, lease)
             self.ready_on(db, lease.user_id)
@@ -496,8 +630,8 @@ class JobCoordinator:
                 (reason, lease.user_id, lease.request_id, lease.owner, lease.generation))
 
     def final_check(self, user_id, stamp, candidates, policy):
-        with self.transaction(False) as db:
-            if self.ready_on(db, user_id) != stamp or policy.epoch != stamp[1]:
+        with self._read_readiness.snapshot(self, user_id) as (db, current_stamp):
+            if current_stamp != stamp or policy.epoch != stamp[1]:
                 raise SnapshotChanged("search_snapshot_changed")
             for candidate in candidates:
                 source = db.execute("""SELECT m.*,p.source_version,p.content_sha256,
@@ -524,13 +658,18 @@ class LeaseHeartbeat:
     def __init__(self, coordinator, lease):
         self.coordinator, self.lease = coordinator, lease
         self.stop, self.lost = threading.Event(), threading.Event()
-        self.thread = threading.Thread(target=self._run, daemon=True)
+        context = copy_context()
+        self.thread = threading.Thread(target=lambda: context.run(self._run), daemon=True)
 
     def _run(self):
         while not self.stop.wait(RENEW_INTERVAL):
             try:
                 self.coordinator.renew(self.lease)
-            except Exception:
+            except Exception as exc:
+                # Keep the original safe type/code and the request correlation.
+                # Never log exception messages, source text or identifiers.
+                from app import diagnostics
+                diagnostics.emit('operation_failed', reason='lease_renewal_failed', exc=exc)
                 self.lost.set()
                 return
 

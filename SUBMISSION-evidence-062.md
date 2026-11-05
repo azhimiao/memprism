@@ -1,3 +1,5 @@
+> Historical submission notes. For the Full completion snapshot, see [SUBMISSION-current.md](SUBMISSION-current.md).
+
 # MemPrism — evidence-architecture-062-03
 
 The platform's existing version label is `memprism-hybrid-037`; the current

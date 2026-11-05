@@ -1,3 +1,5 @@
+> Historical submission notes. For the Full completion snapshot, see [SUBMISSION-current.md](SUBMISSION-current.md).
+
 # MemPrism：现有线上Hybrid版本申请说明
 
 本文件对应旧版本`memprism-hybrid-027`。提交申请前，运营方应确认服务器代码与以下固定Commit一致；仅health的config_hash相同不能证明源码一致。仓库main的新代码尚未部署，不应将新main Commit填作当前线上版本。

@@ -1,0 +1,2 @@
+# Optional test-only dependency for the local TLS connection-pool test.
+cryptography==46.0.3

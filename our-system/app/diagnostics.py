@@ -1,7 +1,7 @@
 """Bounded structured diagnostics, excluding text, credentials and exception messages."""
 from __future__ import annotations
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import wraps
 import json
 import re
@@ -17,7 +17,7 @@ _STAGES = frozenset(('transport', 'authentication', 'capacity', 'request_body',
     'vector_coverage', 'readiness_before_embedding', 'embedding', 'readiness_after_embedding',
     'search_snapshot', 'evidence_selection', 'evidence_final_check', 'snapshot_retry'))
 _EVENTS = frozenset(('request_started', 'request_finished', 'request_failed', 'operation_failed',
-    'stage_started', 'stage_finished', 'stage_failed', 'embedding_http',
+    'stage_started', 'stage_finished', 'stage_failed', 'stage_timing', 'embedding_http',
     'embedding_transport_failed', 'snapshot_retry', 'input_shape', 'startup'))
 _REASONS = frozenset(('incomplete_catalog_route', 'unauthorized', 'service capacity reached',
     'request body exceeds configured limit', 'client_disconnected', 'control_not_ready',
@@ -33,22 +33,26 @@ _REASONS = frozenset(('incomplete_catalog_route', 'unauthorized', 'service capac
     'preparation_busy', 'lease_lost', 'lease_renewal_failed', 'required_embedding_not_ready',
     'request_payload_conflict'))
 _REASONS = _REASONS | {'invalid_vector', 'zero_vector', 'invalid_response_index',
-    'query_context_budget_exceeded', 'query_window_budget_exceeded'}
+    'query_context_budget_exceeded', 'query_window_budget_exceeded',
+    'catalog_read_reopened', 'readiness_audit_busy', 'readiness_database_replaced', 'prepared_sources_changed',
+    'prepared_spans_changed', 'required_atom_not_ready', 'health_snapshot_changed'}
 _NUMBERS = frozenset(('status', 'elapsed_ms', 'attempt', 'query_chars', 'query_utf8_bytes',
     'option_count', 'text_count', 'active', 'limit', 'body_bytes', 'max_text_bytes', 'sqlite_errorcode', 'branch_line',
-    'retry_after_seconds'))
+    'retry_after_seconds', 'response_bytes', 'returned_items', 'output_characters',
+    'packed_record_tokens', 'active_rows', 'snapshot_attempts'))
 _MODULES = frozenset('app.' + name for name in ('api', 'transport', 'diagnostics', 'retrieval',
-    'embeddings', 'embedding_accounting', 'jobs', 'store', 'memory_core', 'segments', 'exact_dense',
+    'embeddings', 'embedding_accounting', 'jobs', 'store', 'memory_core', 'segments', 'exact_dense', 'vector_json', 'vector_checks',
     'queryplan', 'query', 'ingest', 'governance', 'reranking', 'profiles', 'models', 'atomic_memory',
     'evidence_navigation', 'capability_views', 'claim_projection', 'k0_migrate', 'set_selection',
-    'evidence_budget', 'evidence_units'))
+    'evidence_budget', 'evidence_units', 'read_readiness', 'read_pool', 'write_runtime', 'evidence_catalog'))
 _CLASSES = frozenset(('ValueError', 'TypeError', 'RuntimeError', 'KeyError', 'IndexError',
     'AttributeError', 'AssertionError', 'OSError', 'TimeoutError', 'MemoryError', 'OperationalError',
     'IntegrityError', 'DatabaseError', 'ProgrammingError', 'ReadTimeout', 'ConnectTimeout',
     'WriteTimeout', 'PoolTimeout', 'ConnectError', 'ReadError', 'WriteError', 'RemoteProtocolError',
     'LocalProtocolError', 'EmbeddingFailure', 'NotReady', 'SnapshotChanged', 'LifecycleSnapshotBusy',
     'RequestPayloadConflict', 'CancelledError', 'JSONDecodeError', 'OverflowError', 'UnicodeEncodeError',
-    'InvalidSearchInput'))
+    'InvalidSearchInput', 'SystemError', 'NameError', 'UnboundLocalError',
+    'RecursionError', 'ReferenceError', 'ZeroDivisionError', 'FloatingPointError'))
 
 
 @dataclass
@@ -57,6 +61,7 @@ class Diagnostic:
     endpoint: str
     stage: str = 'transport'
     reason: str | None = None
+    stage_started: float = field(default_factory=time.perf_counter)
 
 
 _REQUEST: ContextVar[Diagnostic | None] = ContextVar('aml_diagnostic', default=None)
@@ -101,7 +106,18 @@ def current_id():
 
 def stage(value):
     state = _REQUEST.get()
-    if state is not None and value in _STAGES: state.stage = value
+    if state is not None and value in _STAGES and value != state.stage:
+        flush_stage()
+        state.stage = value
+        state.stage_started = time.perf_counter()
+
+
+def flush_stage():
+    state = _REQUEST.get()
+    if state is not None:
+        now = time.perf_counter()
+        emit('stage_timing', elapsed_ms=round((now-state.stage_started)*1000,3))
+        state.stage_started = now
 
 
 def reason(value):

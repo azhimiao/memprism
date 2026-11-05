@@ -452,6 +452,11 @@ def test_start_and_health_cli_use_real_loopback_without_supplier_calls(tmp_path)
         AML_EMBEDDING_DIMENSIONS="64", AML_EMBEDDING_KEY_ENV="V4_TEST_KEY", AML_PORT=str(port),
         PYTHONDONTWRITEBYTECODE="1")
     root = Path(__file__).resolve().parents[1]
+    # Fresh-store bootstrap is separate from the evaluated serving factory.
+    bootstrap = subprocess.run([sys.executable, '-c',
+        'from deploy.runtime import build_app; build_app()'], cwd=root, env=env,
+        capture_output=True, timeout=30)
+    assert bootstrap.returncode == 0, 'fresh-store bootstrap failed'
     # No Add/Search is authorized here: health and unauthenticated rejection only.
     process = subprocess.Popen([sys.executable, "-m", "deploy.start"], cwd=root, env=env,
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

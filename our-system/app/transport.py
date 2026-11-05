@@ -25,8 +25,9 @@ class TransportGuard:
         token = diagnostic.begin(scope['path'])
         started = time.perf_counter()
         status, complete, retry_after = None, False, None
+        response_bytes = 0
         async def observed_send(event):
-            nonlocal status, complete, retry_after
+            nonlocal status, complete, retry_after, response_bytes
             if event['type'] == 'http.response.start':
                 status = event['status']
                 for key, value in event.get('headers', []):
@@ -35,6 +36,7 @@ class TransportGuard:
                 event = dict(event, headers=list(event.get('headers', [])) +
                              [(b'x-aml-diagnostic-id', diagnostic.current_id().encode('ascii'))])
             await send(event)
+            if event["type"] == "http.response.body": response_bytes += len(event.get("body", b""))
             if event['type'] == 'http.response.body' and not event.get('more_body', False): complete = True
         diagnostic.emit('request_started')
         try:
@@ -43,7 +45,9 @@ class TransportGuard:
             diagnostic.emit('request_failed', exc=exc)
             raise
         finally:
+            diagnostic.flush_stage()
             diagnostic.emit('request_finished', status=status, response_complete=complete,
+                            response_bytes=response_bytes,
                             retry_after_seconds=retry_after,
                             elapsed_ms=round((time.perf_counter() - started) * 1000, 3))
             diagnostic.end(token)

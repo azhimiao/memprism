@@ -43,20 +43,54 @@ def tokenizer():
     return tiktoken.get_encoding("o200k_base")
 
 
+_token_counts = OrderedDict()
+_token_counts_lock = threading.Lock()
+_TOKEN_COUNTS_LIMIT = 65536
+_TOKEN_COUNTS_MAX_BYTES = 4 * 1024 * 1024
+_token_counts_bytes = 0
+
+
 def token_count(text):
-    return len(tokenizer().encode(text, disallowed_special=()))
+    """Reuse deterministic token counts, retaining only a digest and integer."""
+    global _token_counts_bytes
+    key = (fragment_hash(), digest(text))
+    with _token_counts_lock:
+        saved = _token_counts.get(key)
+        if saved is not None:
+            _token_counts.move_to_end(key)
+            return saved[0]
+    count = len(tokenizer().encode(text, disallowed_special=()))
+    size = sys.getsizeof(key) + sum(sys.getsizeof(x) for x in key) + sys.getsizeof(count) + 256
+    with _token_counts_lock:
+        prior = _token_counts.pop(key, None)
+        if prior is not None:
+            _token_counts_bytes -= prior[1]
+        if size <= _TOKEN_COUNTS_MAX_BYTES:
+            _token_counts[key] = (count, size)
+            _token_counts_bytes += size
+        while len(_token_counts) > _TOKEN_COUNTS_LIMIT or _token_counts_bytes > _TOKEN_COUNTS_MAX_BYTES:
+            _, (_, removed) = _token_counts.popitem(last=False)
+            _token_counts_bytes -= removed
+    return count
 
 
 _boundary_cache = OrderedDict()
+_boundary_lock = threading.Lock()
+_BOUNDARY_CACHE_LIMIT = 65536
+_BOUNDARY_CACHE_MAX_BYTES = 8 * 1024 * 1024
+_boundary_cache_bytes = 0
 
 
 def boundaries(content):
+    global _boundary_cache_bytes
     if not content:
         return ()
     key = digest(content)
-    cached = _boundary_cache.get(key)
-    if cached is not None:
-        return cached
+    with _boundary_lock:
+        cached = _boundary_cache.get(key)
+        if cached is not None:
+            _boundary_cache.move_to_end(key)
+            return cached[0]
     result, start = [], 0
     while start < len(content):
         remaining = content[start:]
@@ -69,9 +103,13 @@ def boundaries(content):
             while end > start + 1 and token_count(content[start:end]) > 512:
                 end -= max(1, (end - start) // 16)
             cuts = [m.end() + start for m in re.finditer(r"\n|[.!?。！？](?:\s|$)", content[start:end])]
-            natural = [cut for cut in cuts if cut >= start + (end - start) // 2 and token_count(content[start:cut]) <= 512]
-            if natural:
-                end, status = natural[-1], "natural_boundary"
+            # Only the last admissible boundary is used. Check in reverse,
+            # preserving non-monotone Unicode token counts without tokenizing
+            # every earlier sentence prefix of every historical source again.
+            natural = next((cut for cut in reversed(cuts)
+                if cut >= start + (end - start) // 2 and token_count(content[start:cut]) <= 512), None)
+            if natural is not None:
+                end, status = natural, "natural_boundary"
             else:
                 status = "hard_split_requires_context"
         result.append((start, end, status))
@@ -80,9 +118,18 @@ def boundaries(content):
         start = max(start + 1, end - min(160, (end - start) // 4))
     result = tuple(result)
     # The cache holds hashes/offsets only; source text cannot survive erasure.
-    _boundary_cache[key] = result
-    if len(_boundary_cache) > 4096:
-        _boundary_cache.popitem(last=False)
+    size = sys.getsizeof(key) + sys.getsizeof(result) + 256 + sum(
+        sys.getsizeof(row) + sum(sys.getsizeof(x) for x in row) for row in result)
+    with _boundary_lock:
+        previous = _boundary_cache.pop(key, None)
+        if previous is not None:
+            _boundary_cache_bytes -= previous[1]
+        if size <= _BOUNDARY_CACHE_MAX_BYTES:
+            _boundary_cache[key] = (result, size)
+            _boundary_cache_bytes += size
+        while len(_boundary_cache) > _BOUNDARY_CACHE_LIMIT or _boundary_cache_bytes > _BOUNDARY_CACHE_MAX_BYTES:
+            _, (_, removed) = _boundary_cache.popitem(last=False)
+            _boundary_cache_bytes -= removed
     return result
 
 
@@ -218,83 +265,195 @@ _COUNTS_CACHE_LIMIT = 128
 _COUNTS_CACHE_MAX_BYTES = 128 * 1024
 _counts_cache_bytes = 0
 
+# A full-user cache misses after every Add. Reuse validation of unchanged raw
+# sources underneath it, but only after hashing actual snapshot values again.
+# Values retain counts and canonical span IDs (SHA256 identities), never raw
+# IDs, source/lexical text, vectors, sqlite Rows or permission decisions.
+_source_counts_cache = OrderedDict()
+_SOURCE_COUNTS_CACHE_LIMIT = 65536
+_SOURCE_COUNTS_CACHE_MAX_BYTES = 64 * 1024 * 1024
+_source_counts_cache_bytes = 0
+
 
 def _counts_key(groups):
     h = hashlib.sha256()
     for group in groups:
         h.update(b"group")
         for row in group:
-            # sqlite3 scalar values have unambiguous tuple reprs (including
-            # escaped strings, bytes, None and number types). Row-length framing
-            # prevents separator ambiguity. Formatting runs in C rather than
-            # invoking Python/hashlib for every field on every readiness call.
-            encoded = repr(tuple(row)).encode("utf-8")
-            h.update(len(encoded).to_bytes(8, "big"))
-            h.update(encoded)
+            # Hash actual scalar bytes with type/length framing. In particular,
+            # do not repr/escape an entire dense-vector JSON for every snapshot.
+            h.update(len(row).to_bytes(8, "big"))
+            for value in row:
+                if isinstance(value, str):
+                    tag, encoded = b's', value.encode('utf-8')
+                elif isinstance(value, bytes):
+                    tag, encoded = b'b', value
+                elif value is None:
+                    tag, encoded = b'n', b''
+                elif isinstance(value, int):
+                    tag, encoded = b'i', str(value).encode('ascii')
+                elif isinstance(value, float):
+                    tag, encoded = b'f', repr(value).encode('ascii')
+                else:
+                    raise TypeError('unsupported_readiness_scalar')
+                h.update(tag)
+                h.update(len(encoded).to_bytes(8, "big"))
+                h.update(encoded)
         h.update(b"endgroup")
     return h.digest()
 
 
-def counts(db, user_id, profile):
-    """Expected spans come from raw sources, so missing rows cannot look ready."""
-    global _counts_cache_bytes
-    rows = db.execute("""SELECT m.*,p.source_version,p.content_sha256 AS policy_hash
-        FROM raw_messages m LEFT JOIN source_policies p ON m.id=p.raw_id AND m.user_id=p.user_id
-        WHERE m.user_id=? AND m.deletion_state='active'""", (user_id,)).fetchall()
-    table = partition(user_id)
-    registry = db.execute("SELECT table_name FROM span_fts_partitions WHERE user_id=?",(user_id,)).fetchone()
-    fts = {}
-    if registry and registry[0] == table and db.execute("SELECT 1 FROM sqlite_master WHERE name=?",(table,)).fetchone():
-        for r in db.execute(f"SELECT span_id,lexical_text FROM {table}"):
-            fts.setdefault(r[0], []).append(r[1])
-    result = {"active":0,"raw":0,"span":0,"fts":0,"dense":0}
-    # One user-local snapshot, not two queries per expected span. Keep the
-    # exact set, body, metadata, FTS multiplicity and numeric checks below.
-    saved_spans = {r["id"]: dict(r) for r in db.execute(
-        "SELECT * FROM source_spans WHERE user_id=?", (user_id,))}
-    saved_vectors = {r["span_id"]: r for r in db.execute(
-        "SELECT * FROM span_vectors WHERE user_id=? AND embedding_version=? AND dimensions=?",
-        (user_id, profile.model_version, profile.dimensions))}
-    key = _counts_key((
-        [(user_id, profile.model_version, profile.dimensions, fragment_hash())],
-        (tuple(r) for r in rows),
-        (tuple(r.values()) for r in saved_spans.values()),
-        ((span_id, *values) for span_id, values in fts.items()),
-        (tuple(r) for r in saved_vectors.values()),
-    ))
-    with _counts_lock:
-        cached = _counts_cache.get(key)
-        if cached is not None:
-            _counts_cache.move_to_end(key)
-            return dict(cached[0])
-    expected_ids=set();invalid_raw=False
-    for raw in rows:
-        expected = split_source(raw, raw["source_version"] or 1)
-        result["active"] += len(expected)
-        expected_ids.update(p["id"] for p in expected)
-        if not expected or raw["policy_hash"] != digest(raw["content"]) or raw["source_version"] is None:
-            invalid_raw=True
-            continue
-        result["raw"] += len(expected)
+def _source_counts(raw, saved_spans, fts, saved_vectors, dimensions):
+    """Validate one source; callers must fingerprint its complete actual rows."""
+    expected = split_source(raw, raw["source_version"] or 1)
+    expected_ids = tuple(p["id"] for p in expected)
+    result = [len(expected), 0, 0, 0, 0]
+    invalid = not expected or raw["policy_hash"] != digest(raw["content"]) or raw["source_version"] is None
+    if not invalid:
+        result[1] = len(expected)
         for piece in expected:
             saved = saved_spans.get(piece["id"])
             if not saved or saved != piece:
                 continue
-            result["span"] += 1
+            result[2] += 1
             if fts.get(piece["id"]) == [build_lexical_text(piece["content"])]:
-                result["fts"] += 1
+                result[3] += 1
             v = saved_vectors.get(piece["id"])
             if v and v["content_sha256"] == piece["span_sha256"]:
                 from app.vector_checks import valid_vector_json
-                if valid_vector_json(v["vector_json"],profile.dimensions):
-                    result["dense"] += 1
-    actual_ids=set(saved_spans)
+                if valid_vector_json(v["vector_json"], dimensions):
+                    result[4] += 1
+    return tuple(result), expected_ids, bool(invalid)
+
+
+def _remember_source_counts(key, value):
+    global _source_counts_cache_bytes
+    # Charge recursively retained tuple members and a conservative allowance for
+    # the OrderedDict node, wrapper and byte counter. Large sources may bypass
+    # caching; neither entry churn nor a single huge span set can grow it.
+    def size_of(obj):
+        return sys.getsizeof(obj) + (sum(size_of(v) for v in obj) if isinstance(obj, tuple) else 0)
+    size = sys.getsizeof(key) + size_of(value) + 256
+    with _counts_lock:
+        old = _source_counts_cache.pop(key, None)
+        if old is not None:
+            _source_counts_cache_bytes -= old[1]
+        if size <= _SOURCE_COUNTS_CACHE_MAX_BYTES:
+            _source_counts_cache[key] = (value, size)
+            _source_counts_cache_bytes += size
+        while (len(_source_counts_cache) > _SOURCE_COUNTS_CACHE_LIMIT or
+               _source_counts_cache_bytes > _SOURCE_COUNTS_CACHE_MAX_BYTES):
+            _, (_, removed_size) = _source_counts_cache.popitem(last=False)
+            _source_counts_cache_bytes -= removed_size
+
+
+_SOURCE_VECTOR_SQL = '''SELECT v.* FROM source_spans s
+    CROSS JOIN span_vectors v ON v.span_id=s.id AND v.user_id=s.user_id
+    WHERE s.user_id=? AND s.source_raw_id=? AND v.embedding_version=? AND v.dimensions=?
+    ORDER BY v.span_id'''
+
+
+_AUDIT_RAW_FIELDS = ('id','user_id','session_id','request_id','message_index','role','content',
+    'source_timestamp','recorded_at','privacy_level','deletion_state','source_version','policy_hash')
+_AUDIT_SPAN_FIELDS = ('id','user_id','source_raw_id','source_version','source_sha256',
+    'span_start','span_end','span_sha256','fragment_hash','content','span_index',
+    'boundary_status','token_count','previous_id','next_id')
+_AUDIT_VECTOR_FIELDS = ('user_id','span_id','embedding_version','dimensions','content_sha256','vector_json')
+_AUDIT_SOURCE_SQL = '''SELECT m.*,p.source_version,p.content_sha256 AS policy_hash,
+    ''' + ','.join('s.'+k+' AS s_'+k for k in _AUDIT_SPAN_FIELDS) + ',' + ','.join(
+    'v.'+k+' AS v_'+k for k in _AUDIT_VECTOR_FIELDS) + '''
+    FROM raw_messages m INDEXED BY idx_raw_messages_user
+    LEFT JOIN source_policies p ON p.raw_id=m.id AND p.user_id=m.user_id
+    LEFT JOIN source_spans s INDEXED BY spans_user_source ON s.user_id=m.user_id AND s.source_raw_id=m.id
+    LEFT JOIN span_vectors v ON v.user_id=s.user_id AND v.span_id=s.id AND v.embedding_version=? AND v.dimensions=?
+    WHERE m.user_id=? AND m.deletion_state='active'
+    ORDER BY m.rowid,s.rowid'''
+
+
+def counts(db, user_id, profile, *, request_id=None):
+    """Read each source and its actual indexed vectors in one streaming join.
+
+    All current values still participate in source fingerprints. Only one raw
+    source's vector JSON is retained at a time; counts do not authorize access.
+    """
+    global _counts_cache_bytes
+    from itertools import groupby
+    table = partition(user_id)
+    registry = db.execute('SELECT table_name FROM span_fts_partitions WHERE user_id=?', (user_id,)).fetchone()
+    table_exists = bool(db.execute('SELECT 1 FROM sqlite_master WHERE name=?', (table,)).fetchone())
+    fts = {}
+    if registry and registry[0] == table and table_exists:
+        sql = f'SELECT span_id,lexical_text FROM {table}'
+        params = ()
+        if request_id is not None:
+            sql = (f'SELECT f.span_id,f.lexical_text FROM {table} f '
+                'JOIN source_spans s ON s.id=f.span_id AND s.user_id=? '
+                'JOIN raw_messages m ON m.id=s.source_raw_id AND m.user_id=s.user_id '
+                'WHERE m.request_id=?')
+            params = (user_id, request_id)
+        for row in db.execute(sql, params):
+            fts.setdefault(row[0], []).append(row[1])
+    metadata = [(user_id, profile.model_version, profile.dimensions, fragment_hash())]
+    registration = [tuple(registry) if registry else (), (table_exists,)]
+    result = dict.fromkeys(('active','raw','span','fts','dense'), 0)
+    expected_ids, invalid_raw = set(), False
+    whole = hashlib.sha256(_counts_key((metadata, registration)))
+    sql = _AUDIT_SOURCE_SQL
+    params = (profile.model_version, profile.dimensions, user_id)
+    if request_id is not None:
+        sql = sql.replace('ORDER BY m.rowid,s.rowid', 'AND m.request_id=? ORDER BY m.rowid,s.rowid')
+        params += (request_id,)
+    rows = db.execute(sql, params)
+    for _, group in groupby(rows, key=lambda row:row['id']):
+        raw, saved_spans, saved_vectors = None, {}, {}
+        for row in group:
+            if raw is None:
+                raw = {name:row[name] for name in _AUDIT_RAW_FIELDS}
+            if row['s_id'] is not None:
+                saved_spans[row['s_id']] = {name:row['s_'+name] for name in _AUDIT_SPAN_FIELDS}
+            if row['v_span_id'] is not None:
+                saved_vectors[row['v_span_id']] = {name:row['v_'+name] for name in _AUDIT_VECTOR_FIELDS}
+        # Small source-local ordering matches the old fingerprints independently
+        # of insertion order. Never sort/materialize all a user's vector JSON.
+        source_spans = [saved_spans[k] for k in sorted(saved_spans)]
+        source_key = _counts_key((metadata, registration, [tuple(raw.values())],
+            (tuple(s.values()) for s in source_spans),
+            ((s['id'], *fts.get(s['id'], ())) for s in source_spans),
+            (tuple(saved_vectors[s['id']].values()) for s in source_spans if s['id'] in saved_vectors)))
+        whole.update(source_key)
+        with _counts_lock:
+            cached = _source_counts_cache.get(source_key)
+            if cached is not None:
+                _source_counts_cache.move_to_end(source_key)
+                summary = cached[0]
+            else:
+                summary = None
+        if summary is None:
+            summary = _source_counts(raw, saved_spans, fts, saved_vectors, profile.dimensions)
+            _remember_source_counts(source_key, summary)
+        source_result, source_ids, invalid = summary
+        for name, count in zip(result, source_result):
+            result[name] += count
+        expected_ids.update(source_ids)
+        invalid_raw |= invalid
+        # Drop vector references before the next group is collected.
+        del saved_vectors, saved_spans, source_spans, row
+    actual_sql = 'SELECT id FROM source_spans WHERE user_id=?'
+    params = (user_id,)
+    if request_id is not None:
+        actual_sql = ('SELECT s.id FROM source_spans s JOIN raw_messages m '
+            'ON m.id=s.source_raw_id AND m.user_id=s.user_id WHERE s.user_id=? AND m.request_id=?')
+        params += (request_id,)
+    actual_ids = {r[0] for r in db.execute(actual_sql, params)}
     if actual_ids != expected_ids:
-        result["span"]=-1
+        result['span'] = -1
     if set(fts) != expected_ids:
-        result["fts"]=-1
+        result['fts'] = -1
     if invalid_raw:
-        result["raw"]=-1
+        result['raw'] = -1
+    # Retain only digest/count pairs for bounded accounting, never use an old
+    # whole-user entry instead of this invocation's actual-row checks.
+    key = whole.digest()
     with _counts_lock:
         value = tuple(result.items())
         # Charge all recursively retained objects plus a conservative 256-byte
@@ -312,6 +471,45 @@ def counts(db, user_id, profile):
                _counts_cache_bytes > _COUNTS_CACHE_MAX_BYTES):
             _, (_, removed_size) = _counts_cache.popitem(last=False)
             _counts_cache_bytes -= removed_size
+    return result
+
+
+def append_safe_triggers(db):
+    """Only the exact built-in catalog invalidators may accompany a delta."""
+    allowed = set()
+    for target in ('raw_messages','source_policies','evidence_062_sources','evidence_062_blocks'):
+        for action in ('INSERT','UPDATE','DELETE'):
+            who = 'OLD' if action == 'DELETE' else 'NEW'
+            name = f'evidence_062_invalidate_{target}_{action.lower()}'
+            sql = (f'CREATE TRIGGER {name} AFTER {action} ON {target} BEGIN '
+                f'DELETE FROM evidence_062_proofs WHERE user_id={who}.user_id; END')
+            allowed.add((name, sql))
+    actual = {(r[0],r[1]) for r in db.execute("SELECT name,sql FROM sqlite_schema WHERE type='trigger'")}
+    return actual <= allowed
+
+
+def append_counts(db, user_id, profile, request_id, prior):
+    """Exact delta for a previously audited, trigger-free append transaction.
+
+    The caller pins a trusted pre-write proof under BEGIN IMMEDIATE, allows
+    only ordinary new active sources, and excludes lifecycle mutations. Validate
+    the persisted delta (never just prepared input), then check global membership
+    counts to reject extra/missing spans or FTS rows in the same transaction.
+    """
+    from app.jobs import NotReady
+    delta = counts(db, user_id, profile, request_id=request_id)
+    keys = ('active', 'raw', 'span', 'fts', 'dense')
+    for route in keys:
+        if delta[route] != delta['active'] or prior[route] != prior['active']:
+            raise NotReady('incomplete_'+route+'_route')
+    result = {route: prior[route]+delta[route] for route in keys}
+    actual = db.execute('SELECT COUNT(*) FROM source_spans WHERE user_id=?', (user_id,)).fetchone()[0]
+    table = partition(user_id)
+    fts_count = db.execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0]
+    if actual != result['active']:
+        raise NotReady('incomplete_span_route')
+    if fts_count != result['active']:
+        raise NotReady('incomplete_fts_route')
     return result
 
 

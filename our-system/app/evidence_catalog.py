@@ -69,9 +69,14 @@ def sync(db, user, *, force=False):
     changed = set(existing) - eligible.keys()
     changed.update(raw for raw, stamp in eligible.items() if force or existing.get(raw) != (*stamp, VERSION))
     for raw in sorted(changed):
-        db.execute(f"DELETE FROM {name} WHERE id IN (SELECT id FROM evidence_062_blocks WHERE user_id=? AND raw_id=?)", (user,raw))
-        db.execute("DELETE FROM evidence_062_blocks WHERE user_id=? AND raw_id=?", (user,raw))
-        db.execute("DELETE FROM evidence_062_sources WHERE user_id=? AND raw_id=?", (user,raw))
+        # A genuinely new source has no old directory rows. Avoid a full FTS
+        # scan for its empty DELETE; retain cleanup for existing/orphan blocks.
+        has_blocks = db.execute('SELECT 1 FROM evidence_062_blocks WHERE user_id=? AND raw_id=? LIMIT 1',
+                                (user,raw)).fetchone() is not None
+        if raw in existing or has_blocks:
+            db.execute(f"DELETE FROM {name} WHERE id IN (SELECT id FROM evidence_062_blocks WHERE user_id=? AND raw_id=?)", (user,raw))
+            db.execute("DELETE FROM evidence_062_blocks WHERE user_id=? AND raw_id=?", (user,raw))
+            db.execute("DELETE FROM evidence_062_sources WHERE user_id=? AND raw_id=?", (user,raw))
         if raw not in eligible:
             continue
         row = db.execute(f"SELECT m.*,p.source_version,p.content_sha256 {SOURCE_JOIN} WHERE m.user_id=? AND m.id=? AND {SAFE}", (user,raw)).fetchone()

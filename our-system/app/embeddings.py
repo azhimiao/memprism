@@ -158,6 +158,8 @@ class HttpEmbeddingProvider:
     def __init__(self, config: EmbeddingConfig, *, transport: httpx.BaseTransport | None = None):
         self.config = config
         self._transport = transport
+        from app.embedding_http_pool import TransportPool
+        self._http_pool = TransportPool(transport)
         if config.provider == "dashscope":
             self.implementation_kind = "dashscope_http_v1"
         self._rate_lock = threading.Lock()
@@ -244,7 +246,7 @@ class HttpEmbeddingProvider:
             return None
 
         # No implicit proxy, redirects, SDK retries, or logging of request/response bodies.
-        with httpx.Client(timeout=self.config.timeout_seconds, transport=self._transport,
+        with httpx.Client(timeout=self.config.timeout_seconds, transport=self._http_pool.lease(),
                           trust_env=False, follow_redirects=False) as client:
             for start in range(0, len(texts), self.config.batch_size):
                 batch = list(texts[start:start + self.config.batch_size])
@@ -358,8 +360,9 @@ def embed_retrieval_query(provider: EmbeddingProvider, text: str, *, before_disp
     mean. This is an explicit query approximation, not a whole-text model embedding.
     The caller retains the original query for lexical retrieval and evidence selection.
     Existing provider views keep dispatch authorization, accounting and batch limits.
-    At most ten nonblank windows are permitted, checked before the first dispatch.
-    Multiple HTTP batches may still fail under the provider's existing rate gate.
+    The HTTP boundary bounds the request body. A supplier batch size is not a
+    whole-query limit: all nonblank windows may span multiple HTTP batches,
+    each subject to the existing authorization, accounting and rate gate.
     """
     def dispatch(texts):
         guarded = getattr(provider, 'embed_guarded', None)
@@ -390,10 +393,6 @@ def embed_retrieval_query(provider: EmbeddingProvider, text: str, *, before_disp
         chunk = encoded[start:end].decode('utf-8')
         if chunk.strip():
             chunks.append(chunk)
-            if len(chunks) > 10:
-                raise EmbeddingFailure('input_too_long', {'requests': 0,
-                    'query_input_policy': 'utf8_windows_weighted_mean_v1',
-                    'query_window_limit': 10, 'query_window_budget_exceeded': True})
         start = end
     if not chunks:
         raise EmbeddingFailure('invalid_input')
