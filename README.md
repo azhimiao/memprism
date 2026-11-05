@@ -1,16 +1,18 @@
 <div align="center">
 
+**English** | [简体中文](README.zh-CN.md)
+
 <img src="docs/assets/memprism-banner.svg" alt="MemPrism — Evidence that stays connected." width="100%" />
 
-**为 AI Agent 提供持久、可追溯的长期记忆。**
+**Persistent, traceable memory for AI agents.**
 
-从历史对话到可用证据，让每一次交互都有上下文。
+Turn conversation history into usable evidence. Bring context to every interaction.
 
 [![Python 3.12.11](https://img.shields.io/badge/Python-3.12.11-3776AB?style=flat-square)](docs/REPRODUCING.md)
 [![SQLite FTS5](https://img.shields.io/badge/Storage-SQLite%20FTS5-0F7480?style=flat-square)](docs/ARCHITECTURE.md)
 [![License AGPL v3](https://img.shields.io/badge/License-AGPL--3.0-6657CF?style=flat-square)](LICENSE)
 
-[快速开始](#快速开始) · [技术架构](docs/ARCHITECTURE.md) · [API 接入](#api-接入) · [评测记录](docs/EVALUATION.md)
+[Quickstart](#quickstart) · [Architecture](docs/ARCHITECTURE.md) · [API](#api) · [Evaluation](docs/EVALUATION.md)
 
 </div>
 
@@ -18,49 +20,48 @@
 
 ## Memory, with context.
 
-MemPrism 是面向 AI 助手与 Agent 的开源长期记忆引擎。通过 **Add / Search** 两个接口，将持续到来的对话组织成可检索的历史，在需要时返回与问题相关、带有原文依据的证据。
+MemPrism is an open-source long-term memory engine for AI assistants and agents. Two interfaces, **Add / Search**, turn incoming conversations into searchable history and return relevant evidence grounded in the original messages.
 
-**混合检索、上下文组装与一致性管理，在同一条记忆链路中完成。** 底层采用 SQLite / WAL，结合 FTS5 词面检索、精确向量检索和 RRF 排名融合，适合需要自托管、检查数据与复现行为的应用。
+**Hybrid retrieval, context assembly, and consistency management in one memory pipeline.** Built on SQLite / WAL, MemPrism combines FTS5 lexical retrieval, exact vector search, and Reciprocal Rank Fusion (RRF) for applications that need self-hosting, inspectable data, and reproducible behavior.
 
-## 为什么选择 MemPrism
+## Why MemPrism
 
-| 能力 | 为应用带来的价值 |
+| Capability | What it enables |
 | :--- | :--- |
-| **原文可追溯** | 记忆绑定保存的消息、片段偏移与来源哈希，让返回的证据有据可查。 |
-| **词面 × 语义** | 同时召回明确关键词与不同措辞的相关内容，统一融合多路候选。 |
-| **上下文完整性** | 按依赖组织规则、引用、表头与数据行，保留单条命中之外的必要上下文。 |
-| **持续更新** | 借助事务发布、幂等回执与读取快照，协调流式写入和历史检索。 |
-| **确定性处理** | 当前配置以规则构建片段和证据目录，无需生成式 LLM 抽取、摘要或重排序。 |
-| **可自托管** | 记忆存储使用单机 SQLite，HTTP 接口方便集成，源码与运行身份可独立核验。 |
+| **Source provenance** | Memories stay linked to stored messages, span offsets, and source hashes, so retrieved evidence can be traced back. |
+| **Lexical × semantic retrieval** | Find exact keywords and relevant paraphrases, then combine candidates from both retrieval paths. |
+| **Context preservation** | Group rules, references, table headers, and rows by dependency to retain the context surrounding individual matches. |
+| **Continuous updates** | Coordinate streaming writes and historical retrieval through transactional publication, idempotent receipts, and read snapshots. |
+| **Deterministic processing** | The current configuration builds spans and evidence catalogs with rules, without generative LLM extraction, summarization, or reranking. |
+| **Self-hosted storage** | Keep memory in a single-node SQLite database, integrate over HTTP, and independently verify source and runtime identities. |
 
-语义检索使用外部 Embedding 服务，当前配置为 DashScope `text-embedding-v4`（1024 维），会产生供应商费用。
+Semantic retrieval uses an external embedding provider. The current configuration uses DashScope `text-embedding-v4` at 1,024 dimensions; provider charges apply.
 
-## 从对话到证据
+## From conversation to evidence
 
 ```mermaid
 flowchart LR
-    A[历史对话] --> B[Add]
-    B --> C[片段与证据目录]
+    A[Conversation history] --> B[Add]
+    B --> C[Spans and evidence catalog]
     C --> D[(SQLite · FTS5 · Vectors)]
-    Q[当前问题] --> S[Search]
-    D --> H[词面与语义召回]
+    Q[Current question] --> S[Search]
+    D --> H[Lexical and semantic retrieval]
     S --> H
-    H --> F[RRF 融合]
-    F --> E[上下文组装与来源核验]
-    E --> O[原文证据]
-    O --> L[你的 Agent]
+    H --> F[RRF fusion]
+    F --> E[Context assembly and source checks]
+    E --> O[Source evidence]
+    O --> L[Your agent]
 ```
 
-**存下来。** 保留原始消息，建立片段、向量和证据目录；完成所需发布后返回成功回执。
+**Store.** Preserve original messages and build spans, vectors, and an evidence catalog. Return a success receipt after the required publication completes.
 
-**找得到。** 在用户范围与读取快照内，融合词面和语义候选，再组织时间、状态和规则相关的支持证据。
+**Retrieve.** Fuse lexical and semantic candidates within the user's scope and a read snapshot, then assemble supporting evidence around time, state, and rules.
 
-**用得上。** 按条数和预算返回原文证据，由你的 Agent 完成回答或后续任务。
+**Use.** Return original evidence within result and output budgets. Your agent handles the answer or the next action.
 
-## 快速开始
+## Quickstart
 
-
-使用 **Python 3.12.11**，在新的数据库路径上运行。以下 Bash 示例初始化空库，不包含正式评测数据；不要对正在服务的评测库执行初始化。
+Use **Python 3.12.11** and a fresh database path. The Bash example below initializes an empty database without evaluation data. Do not initialize a database that is already serving requests.
 
 ```bash
 set -e
@@ -86,11 +87,11 @@ python -c "from deploy.runtime import build_app; build_app()"
 python -m deploy.start
 ```
 
-Tokenizer 首次准备会下载公开编码资产；初始化空库不需要请求 Embedding，实际 Add/Search 的 Dense 路径需要有效供应商密钥。运行时会核对 Python、依赖、编码资产和数据库身份。完整步骤与现有库的使用边界见[复现指南](docs/REPRODUCING.md)。
+The tokenizer downloads public encoding assets on first setup. Empty-database initialization does not request embeddings; actual Add/Search dense retrieval requires valid provider credentials. The runtime checks Python, dependencies, encoding assets, and database identity. See the [reproduction guide](docs/REPRODUCING.md) for complete instructions and existing-database handling.
 
-## API 接入
+## API
 
-启动服务并配置好服务密钥后，可通过 HTTP 写入与检索。以下为合成示例，实际请求会调用 Embedding 服务。
+Once the service is running and its service key is configured, store and retrieve memory over HTTP. This synthetic example makes actual embedding requests.
 
 ```python
 import os
@@ -101,19 +102,19 @@ with httpx.Client(
     headers={"Authorization": f"Bearer {os.environ['AML_SERVICE_API_KEY']}"},
     timeout=120,
 ) as client:
-    # 保存一段对话；重放同一请求时保留 request_id。
+    # Save a conversation; reuse request_id when replaying this request.
     added = client.post("/add", json={
         "request_id": "demo-001",
         "user_id": "alice",
         "session_id": "planning",
-        "messages": [{"role": "user", "content": "我喜欢安静的咖啡馆，通常周五下午去。"}],
+        "messages": [{"role": "user", "content": "I prefer quiet cafes and usually visit on Friday afternoons."}],
     })
     added.raise_for_status()
 
-    # 为下游 Agent 获取相关原文证据。
+    # Retrieve source evidence for your agent.
     found = client.post("/search", json={
         "user_id": "alice",
-        "query": "我通常什么时候去咖啡馆，有什么偏好？",
+        "query": "When do I usually visit cafes, and what are my preferences?",
         "top_k": 5,
     })
     found.raise_for_status()
@@ -121,39 +122,41 @@ with httpx.Client(
         print(memory["content"])
 ```
 
-| 接口 | 用途 |
+| Endpoint | Purpose |
 | :--- | :--- |
-| `POST /add` | 保存对话并完成索引发布，支持相同请求的幂等重放。 |
-| `POST /search` | 在指定用户范围内返回 `{"data": [...]}` 形式的原文证据。 |
-| `GET /health` | 检查控制就绪状态与配置身份。 |
+| `POST /add` | Store conversations and publish indexes, with idempotent replay of identical requests. |
+| `POST /search` | Return source evidence as `{"data": [...]}` within the specified user's scope. |
+| `GET /health` | Check control readiness and configuration identity. |
 
-Add/Search 使用 Bearer Token。字段定义见[协议模型](our-system/app/models.py)；服务密钥、Embedding 密钥与评测密钥分别管理。部署方还需负责调用方的用户访问授权。
+Add/Search use Bearer Token authentication. See the [protocol models](our-system/app/models.py) for field definitions. Manage service, embedding, and evaluation credentials separately. Deployments must also authorize callers' access to user scopes.
 
-## 适用场景
+## Use cases
 
-- **个人 AI 助手**：在跨会话交流中找回偏好、计划与背景信息。
-- **工作流 Agent**：检索历史规则、操作过程及支撑材料。
-- **长期对话应用**：持续写入新交互，同时保留可检查的历史依据。
-- **记忆系统研究**：使用固定源码身份与合成测试分析检索和一致性行为。
+- **Personal AI assistants:** Retrieve preferences, plans, and background across conversations.
+- **Workflow agents:** Find historical rules, procedures, and supporting materials.
+- **Long-running conversations:** Keep adding interactions while preserving inspectable historical evidence.
+- **Memory research:** Study retrieval and consistency using fixed source identities and synthetic tests.
 
-## 开放验证
+## Open verification
 
-本仓库发布了完成 Agent Memory Leaderboard Cycle 2 文本 Full 评测时的运行源码快照：**9,602 / 9,602 项完成**，包括 Textual 与 Streaming 两个分支。成绩口径、版本沿革和正式结果状态见[评测记录](docs/EVALUATION.md)。
+This repository publishes the runtime source snapshot used at completion of the Agent Memory Leaderboard Cycle 2 textual Full evaluation: **9,602 / 9,602 items completed**, across the Textual and Streaming branches. See the [evaluation record](docs/EVALUATION.md) for score reporting, version history, and official result status.
 
-公开发行的工程验证包含 **1,322 项应用测试通过、24 项网关测试通过**；另有 35 项原有测试跳过。50 份运行文件与评测结束时的冻结副本逐文件核验一致。[查看验证记录](releases/verification.json)
+Public-release engineering validation recorded **1,322 application tests passed and 24 gateway tests passed**, with 35 existing tests skipped. All 50 runtime files were checked byte for byte against the frozen evaluation-completion snapshot. [Verification record](releases/verification.json)
 
-## 文档
+## Documentation
 
-| 文档 | 内容 |
+The detailed guides below are currently in Simplified Chinese; this page provides the English overview and setup examples.
+
+| Guide | Contents |
 | :--- | :--- |
-| [技术架构](docs/ARCHITECTURE.md) | 数据流、检索、证据组织、一致性与实现边界。 |
-| [部署与复现](docs/REPRODUCING.md) | 环境、配置、初始化、启动与验证。 |
-| [评测记录](docs/EVALUATION.md) | Full 完成情况、成绩口径与运行版本。 |
-| [运行文件清单](releases/runtime-103.json) | 公开运行文件的 SHA256 身份。 |
-| [研究参考](docs/REFERENCES.md) | 相关工作与基础技术归属。 |
+| [Architecture](docs/ARCHITECTURE.md) | Data flow, retrieval, evidence assembly, consistency, and implementation limits. |
+| [Deployment and reproduction](docs/REPRODUCING.md) | Environment, configuration, initialization, startup, and verification. |
+| [Evaluation](docs/EVALUATION.md) | Full completion, score reporting, and runtime versions. |
+| [Runtime manifest](releases/runtime-103.json) | SHA256 identities of the published runtime files. |
+| [Research references](docs/REFERENCES.md) | Related work and underlying technical attribution. |
 
-当前实现采用精确向量扫描，检索成本随用户历史规模增长；单机写入协调和外部 Embedding 延迟也会影响吞吐。部署与规模规划请参阅[架构说明](docs/ARCHITECTURE.md)。
+The implementation uses exact vector scanning, so retrieval cost grows with each user's history. Single-node write coordination and external embedding latency also affect throughput. Consult the [architecture guide](docs/ARCHITECTURE.md) when planning deployment and scale.
 
 ## License
 
-[GNU Affero General Public License v3.0](LICENSE)。
+[GNU Affero General Public License v3.0](LICENSE).
